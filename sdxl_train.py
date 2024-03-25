@@ -39,6 +39,7 @@ from library.custom_train_functions import (
     scale_v_prediction_loss_like_noise_prediction,
     add_v_prediction_like_loss,
     apply_debiased_estimation,
+    apply_noise_compensation
 )
 from library.sdxl_original_unet import SdxlUNet2DConditionModel
 
@@ -576,6 +577,7 @@ def train(args):
                     or args.scale_v_pred_loss_like_noise_pred
                     or args.v_pred_like_loss
                     or args.debiased_estimation_loss
+                    or args.timestep_noise_compensation
                 ):
                     # do not mean over batch dimension for snr weight or scale v-pred loss
                     loss = torch.nn.functional.mse_loss(noise_pred.float(), target.float(), reduction="none")
@@ -589,6 +591,8 @@ def train(args):
                         loss = add_v_prediction_like_loss(loss, timesteps, noise_scheduler, args.v_pred_like_loss)
                     if args.debiased_estimation_loss:
                         loss = apply_debiased_estimation(loss, timesteps, noise_scheduler)
+                    if args.timestep_noise_compensation:
+                        loss = apply_noise_compensation(loss, timesteps, noise_scheduler)
 
                     loss = loss.mean()  # mean over batch dimension
                 else:

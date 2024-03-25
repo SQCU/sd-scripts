@@ -99,6 +99,12 @@ def apply_debiased_estimation(loss, timesteps, noise_scheduler):
     loss = weight * loss
     return loss
 
+def apply_noise_compensation(loss, timesteps, noise_scheduler):
+    noise_comp = (noise_scheduler.alphas_cumprod.sqrt() + (1 - noise_scheduler.alphas_cumprod).sqrt()).to(device=accelerator.device) # does cheald magic to match forward noising bias
+    noise_pred = noise_pred / noise_comp[timesteps] # .sqrt() # attempts to cancel forward noising bias
+    loss = torch.nn.functional.mse_loss(noise_pred.float(), target.float(), reduction="none")
+    return loss
+
 # TODO train_utilと分散しているのでどちらかに寄せる
 
 
@@ -124,6 +130,11 @@ def add_custom_train_arguments(parser: argparse.ArgumentParser, support_weighted
         "--debiased_estimation_loss",
         action="store_true",
         help="debiased estimation loss / debiased estimation loss",
+    )
+    parser.add_argument(
+        "--timestep_noise_compensation",
+        action="store_true",
+        help="cheald's timestep noise scheduling patch experiment",
     )
     if support_weighted_captions:
         parser.add_argument(

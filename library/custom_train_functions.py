@@ -99,7 +99,7 @@ def apply_debiased_estimation(loss, timesteps, noise_scheduler):
     loss = weight * loss
     return loss
 
-def apply_noise_compensation(loss, timesteps, noise_scheduler):
+def apply_noise_compensation(loss, timesteps, noise_scheduler): # why two steps instead of noise_pred = noise_pred/(noise_scheduler.alphas_cumprod.sqrt() + (1 - noise_scheduler.alphas_cumprod)[timesteps]
     noise_comp = (noise_scheduler.alphas_cumprod.sqrt() + (1 - noise_scheduler.alphas_cumprod).sqrt()).to(device=accelerator.device) # does cheald magic to match forward noising bias
     noise_pred = noise_pred / noise_comp[timesteps] # .sqrt() # attempts to cancel forward noising bias
     loss = torch.nn.functional.mse_loss(noise_pred.float(), target.float(), reduction="none")
@@ -135,6 +135,11 @@ def add_custom_train_arguments(parser: argparse.ArgumentParser, support_weighted
         "--timestep_noise_compensation",
         action="store_true",
         help="cheald's timestep noise scheduling patch experiment",
+    )
+    parser.add_argument(
+        "--noisepred_timestep_compensation",
+        action="store_true",
+        help="cheald's followup experiment, changing noisy_latent target earlier in control flow.",
     )
     if support_weighted_captions:
         parser.add_argument(

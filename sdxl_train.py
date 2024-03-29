@@ -566,6 +566,11 @@ def train(args):
 
                 noisy_latents = noisy_latents.to(weight_dtype)  # TODO check why noisy_latents is not weight_dtype
 
+                # normalize noisy latents before prediction
+                if args.noisepred_timestep_compensation
+                    noise_comp = (noise_scheduler.alphas_cumprod.sqrt() + (1 - noise_scheduler.alphas_cumprod).sqrt()).to(device=latents.device)
+                    noisy_latents = noisy_latents / noise_comp[timesteps].reshape(-1, 1, 1, 1)
+
                 # Predict the noise residual
                 with accelerator.autocast():
                     noise_pred = unet(noisy_latents, timesteps, text_embedding, vector_embedding)

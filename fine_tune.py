@@ -250,7 +250,9 @@ def train(args):
         unet.to(weight_dtype)
         text_encoder.to(weight_dtype)
 
+
     use_schedule_free_optimizer = args.optimizer_type.lower().endswith("schedulefree")
+
     if args.deepspeed:
         if args.train_text_encoder:
             ds_model = deepspeed_utils.prepare_deepspeed_model(args, unet=unet, text_encoder=text_encoder)

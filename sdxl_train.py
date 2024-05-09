@@ -10,6 +10,7 @@ import toml
 from tqdm import tqdm
 
 import torch
+import torch.nn.functional as F
 from library.device_utils import init_ipex, clean_memory_on_device
 
 
@@ -600,6 +601,11 @@ def train(args):
 
                 noisy_latents = noisy_latents.to(weight_dtype)  # TODO check why noisy_latents is not weight_dtype
 
+                # normalize noisy latents before prediction
+                if args.noisepred_timestep_compensation
+                    noise_comp = (noise_scheduler.alphas_cumprod.sqrt() + (1 - noise_scheduler.alphas_cumprod).sqrt()).to(device=latents.device)
+                    noisy_latents = noisy_latents / noise_comp[timesteps].reshape(-1, 1, 1, 1)
+
                 # Predict the noise residual
                 with accelerator.autocast():
                     noise_pred = unet(noisy_latents, timesteps, text_embedding, vector_embedding)
@@ -612,11 +618,16 @@ def train(args):
                     or args.v_pred_like_loss
                     or args.debiased_estimation_loss
                     or args.masked_loss
+                    or args.timestep_noise_compensation
                 ):
                     # do not mean over batch dimension for snr weight or scale v-pred loss
                     loss = train_util.conditional_loss(
                         noise_pred.float(), target.float(), reduction="none", loss_type=args.loss_type, huber_c=huber_c
                     )
+
+                ):
+                    # do not mean over batch dimension for snr weight or scale v-pred loss.
+                    loss = train_util.conditional_loss(noise_pred.float(), target.float(), reduction="none", loss_type=args.loss_type, huber_c=huber_c)
                     if args.masked_loss:
                         loss = apply_masked_loss(loss, batch)
                     loss = loss.mean([1, 2, 3])
@@ -629,8 +640,18 @@ def train(args):
                         loss = add_v_prediction_like_loss(loss, timesteps, noise_scheduler, args.v_pred_like_loss)
                     if args.debiased_estimation_loss:
                         loss = apply_debiased_estimation(loss, timesteps, noise_scheduler)
+                    if args.timestep_noise_compensation:
+                        loss = apply_noise_compensation(loss, timesteps, noise_scheduler)
 
                     loss = loss.mean()  # mean over batch dimension
+                elif args.siginterp_variation_loss:
+                    alphas_cumprod = noise_scheduler.alphas_cumprod.to(accelerator.device)
+                    ac = alphas_cumprod[timesteps]
+                    mae_loss = F.l1_loss(noise_pred, target, reduction="none")
+                    base_loss = 1/-mae_loss.exp() + 1
+                    loss = base_loss.mean(dim=(2, 3), keepdims=True) * ac
+                    loss = loss + base_loss.std(dim=(2,3), keepdims=True) * (1-ac)
+                    
                 else:
                     loss = train_util.conditional_loss(
                         noise_pred.float(), target.float(), reduction="mean", loss_type=args.loss_type, huber_c=huber_c

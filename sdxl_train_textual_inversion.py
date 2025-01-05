@@ -123,7 +123,7 @@ class SdxlTextualInversionTrainer(train_textual_inversion.TextualInversionTraine
 def setup_parser() -> argparse.ArgumentParser:
     parser = train_textual_inversion.setup_parser()
     # don't add sdxl_train_util.add_sdxl_training_arguments(parser): because it only adds text encoder caching
-    # sdxl_train_util.add_sdxl_training_arguments(parser)
+    sdxl_train_util.add_sdxl_training_arguments(parser)
     return parser
 
 

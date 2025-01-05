@@ -48,8 +48,8 @@ from library.custom_train_functions import (
     nullify_implicit_v_lossweight,
     slam_implicit_v_lossweight
 )
-from library.sdxl_original_unet import SdxlUNet2DConditionModel
-
+#from library.sdxl_original_unet import SdxlUNet2DConditionModel
+from library.sdxl_original_unet_skiplambda import SdxlUNet2DConditionModel
 
 UNET_NUM_BLOCKS_FOR_BLOCK_LR = 23
 

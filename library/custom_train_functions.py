@@ -2,6 +2,7 @@ import torch
 import argparse
 import random
 import re
+import math
 from typing import List, Optional, Union
 from .utils import setup_logging
 
@@ -96,13 +97,53 @@ def add_v_prediction_like_loss(loss, timesteps, noise_scheduler, v_pred_like_los
     return loss
 
 
-def apply_debiased_estimation(loss, timesteps, noise_scheduler):
+def apply_debiased_estimation(loss, timesteps, noise_scheduler, v_prediction=False):
     snr_t = torch.stack([noise_scheduler.all_snr[t] for t in timesteps])  # batch_size
     snr_t = torch.minimum(snr_t, torch.ones_like(snr_t) * 1000)  # if timestep is 0, snr_t is inf, so limit it to 1000
-    weight = 1 / torch.sqrt(snr_t)
-    loss = weight * loss
+    if v_prediction:
+        weight = 1 / torch.sqrt(snr_t + 1)
+    else:
+        weight = 1 / torch.sqrt(snr_t)
+    loss = loss = weight * loss
     return loss
 
+def apply_karras_edm_weighting(loss, timesteps, noise_scheduler):
+    alphas_cprd = torch.stack([noise_scheduler.alphas_cumprod[t] for t in timesteps])
+    weight = ((1-alphas_cprd)**0.5)**-2
+    loss = loss * weight.float().to(dtype=loss.dtype, device=loss.device)
+    #loss times sigma(timestep)**-2. could it really be so simple? yes. is this analytically wrong? almost certainly. is default loss unweighted? you betcha!
+    return loss 
+
+def apply_salimans_vpred_weighting(loss, timesteps, noise_scheduler, v_prediction=False):
+    #all_snr = (alpha / sigma) ** 2. this matches the salimans reference implementation, so we're done!
+    snr = torch.stack([noise_scheduler.all_snr[t] for t in timesteps]).float().to(dtype=loss.dtype, device=loss.device)
+    loss = loss * (snr+1) #could it really be so simple? yes. is this analytically right? certainly.
+    return loss
+
+def apply_sigmoid_k_weighting(loss, timesteps, noise_scheduler, v_prediction=False, k_const=2):
+    snr = torch.stack([noise_scheduler.all_snr[t] for t in timesteps])
+    v_baseline_loss = torch.ones_like(snr)
+    #if v_prediction:   #super unstable
+    #    v_baseline_loss = torch.exp(-torch.log(snr)/2)
+    sigmo_loss = torch.sigmoid(-torch.log(snr)+k_const).float().to(dtype=loss.dtype, device=loss.device)
+    #if v_prediction:    #an alternate reading?
+    #    nullify_implicit_v_lossweight(loss, timesteps, noise_scheduler, v_prediction)
+
+    loss = loss * (sigmo_loss / v_baseline_loss)
+    return loss
+
+def nullify_implicit_v_lossweight(loss, timesteps, noise_scheduler, v_prediction=False):
+    snr = torch.stack([noise_scheduler.all_snr[t] for t in timesteps])
+    v_baseline_loss = torch.exp(-torch.log(snr+1)/2)  #AAAAAA . t=0 *= 0.02, t=T *= 0.996 ?
+    #print(f"loss:{loss}\nv_baseline_loss_weight:{v_baseline_loss}")
+    loss = loss * (v_baseline_loss.float().to(dtype=loss.dtype, device=loss.device) ** -1) # if we divided this, which is what vibed right at first, we are scaling in the same direction as snr weighting.
+    return loss
+
+def slam_implicit_v_lossweight(loss, timesteps, noise_scheduler, v_prediction=False):
+    snr = torch.stack([noise_scheduler.all_snr[t] for t in timesteps])
+    v_baseline_loss = torch.exp(-torch.log(snr)/2)  #AAAAAA . t=0 *= 0.02, t=T *= 0.996 ?
+    loss = loss * v_baseline_loss.float().to(dtype=loss.dtype, device=loss.device) # lets multiply instead :)
+    return loss
 
 # TODO train_utilと分散しているのでどちらかに寄せる
 
@@ -129,6 +170,66 @@ def add_custom_train_arguments(parser: argparse.ArgumentParser, support_weighted
         "--debiased_estimation_loss",
         action="store_true",
         help="debiased estimation loss / debiased estimation loss",
+    )
+    parser.add_argument(
+        "--karras_edm_loss",
+        action="store_true",
+        default=False,
+        help="after many long and tiresome steps, we contemplate a 1/sigma**2 loss weighting. you multiply your normal ah-ah torch MSE estimation by this term. probably really bad outside of epspred models.",
+    )
+    parser.add_argument(
+        "--salimans_vpred_weighting",
+        action="store_true",
+        default=False,
+        help="what if we read the papers that our algorithms came from? who knows what might happen haha",
+    )
+    parser.add_argument(
+        "--beta_schedule",
+        type=str,
+        default="scaled_linear",
+        help="see diffusers scheduling_ddpm.py (we import this). values include: 'scaled_linear', 'sigmoid', and 'squaredcos_cap_v2'",
+    )
+    parser.add_argument(
+        "--sigmaximum_overdrive",
+        type=float,
+        default=None,
+        help="what if we made things... a little... bigger. pick a target sqrt(width*height) to scale schedules towards.",
+    )
+    parser.add_argument(
+        "--sigmoid_k_weighting",
+        type=float,
+        default=None,
+        help="https://arxiv.org/abs/2303.00848. consider 2, 3, 4. maybe even 1.",
+    )
+    parser.add_argument(
+        "--nullify_implicit_v_lossweight",
+        action="store_true",
+        default=False,
+        help="https://arxiv.org/abs/2303.00848. Table 2.",
+    )
+    parser.add_argument(
+        "--slam_implicit_v_lossweight",
+        action="store_true",
+        default=False,
+        help="https://arxiv.org/abs/2303.00848. Table 2.",
+    )
+    parser.add_argument(
+        "--recorder_loss_buckets",
+        type=int,
+        default=1,
+        help="something has to set the buckers.",
+    )
+    parser.add_argument(
+        "--noisepred_timestep_compensation",
+        action="store_true",
+        default=False,
+        help="cheald's followup experiment, changing noisy_latent target earlier in control flow.",
+    )
+    parser.add_argument(
+        "--clamp_grad_value",
+        type=float,
+        default=False,
+        help="register hook to clamp gradient values e.g. during rather than after backprop",
     )
     if support_weighted_captions:
         parser.add_argument(

@@ -35,15 +35,21 @@ def clean_memory_on_device(device: torch.device):
     r"""
     Clean memory on the specified device, will be called from training scripts.
     """
+    #... should this have been after the empty cache instead of before? what's going on here
     gc.collect()
 
     # device may "cuda" or "cuda:0", so we need to check the type of device
     if device.type == "cuda":
-        torch.cuda.empty_cache()
+        with torch.no_grad():
+            torch.cuda.empty_cache()
     if device.type == "xpu":
-        torch.xpu.empty_cache()
+        with torch.no_grad():
+            torch.xpu.empty_cache()
     if device.type == "mps":
-        torch.mps.empty_cache()
+        with torch.no_grad():
+            torch.mps.empty_cache()
+
+    gc.collect() #can we collect twice? maybe!
 
 
 @functools.lru_cache(maxsize=None)

@@ -21,6 +21,7 @@ from typing import (
     Union,
 )
 from accelerate import Accelerator, InitProcessGroupKwargs, DistributedDataParallelKwargs, PartialState
+from accelerate.utils import FP8RecipeKwargs
 import glob
 import math
 import os
@@ -903,6 +904,14 @@ class BaseDataset(torch.utils.data.Dataset):
         self.image_data[info.image_key] = info
         self.image_to_subset[info.image_key] = subset
 
+    def tqdm_corruption_sniffer(self):
+        for immggy in tqdm(self.image_data.values()):
+            try:
+                im = Image.open(immggy.absolute_path)
+                im2 = im.convert('RGB')
+            except OSError:
+                logger.info("Cannot load : {}".format(immggy.absolute_path))
+
     def make_buckets(self):
         """
         bucketingを行わない場合も呼び出し必須（ひとつだけbucketを作る）
@@ -912,6 +921,10 @@ class BaseDataset(torch.utils.data.Dataset):
         for info in tqdm(self.image_data.values()):
             if info.image_size is None:
                 info.image_size = self.get_image_size(info.absolute_path)
+        
+        logger.info("skipping corruption sniffer. good luck!")
+        #logger.info("effecting corruption sniffer. kindly wait for validation bootstrapping.")
+        #self.tqdm_corruption_sniffer() #image_info.absolute_path
 
         if self.enable_bucket:
             logger.info("make buckets")
@@ -3308,7 +3321,12 @@ def add_optimizer_arguments(parser: argparse.ArgumentParser):
         help="Combines backward pass and optimizer step to reduce VRAM usage. Only available in SDXL"
         + " / バックワードパスとオプティマイザステップを組み合わせてVRAMの使用量を削減します。SDXLでのみ有効",
     )
-
+    parser.add_argument(
+        "--catch_image_corruption",
+        action="store_true",
+        help="Combines backward pass and optimizer step to reduce VRAM usage. Only available in SDXL"
+        + " / バックワードパスとオプティマイザステップを組み合わせてVRAMの使用量を削減します。SDXLでのみ有効",
+    )
 
 def add_training_arguments(parser: argparse.ArgumentParser, support_dreambooth: bool):
     parser.add_argument(
@@ -3433,13 +3451,16 @@ def add_training_arguments(parser: argparse.ArgumentParser, support_dreambooth: 
         "--torch_compile", action="store_true", help="use torch.compile (requires PyTorch 2.0) / torch.compile を使う"
     )
     parser.add_argument(
+        "--torch_compilealter", action="store_true", help="use torch.compile. but works. (requires PyTorch 2.0) / torch.compile を使う"
+    )
+    parser.add_argument(
         "--dynamo_backend",
         type=str,
-        default="inductor",
+        default="NO",
         # available backends:
         # https://github.com/huggingface/accelerate/blob/d1abd59114ada8ba673e1214218cb2878c13b82d/src/accelerate/utils/dataclasses.py#L376-L388C5
         # https://pytorch.org/docs/stable/torch.compiler.html
-        choices=["eager", "aot_eager", "inductor", "aot_ts_nvfuser", "nvprims_nvfuser", "cudagraphs", "ofi", "fx2trt", "onnxrt"],
+        #choices=["eager", "aot_eager", "inductor", "aot_ts_nvfuser", "nvprims_nvfuser", "cudagraphs", "ofi", "fx2trt", "onnxrt"],
         help="dynamo backend type (default is inductor) / dynamoのbackendの種類（デフォルトは inductor）",
     )
     parser.add_argument("--xformers", action="store_true", help="use xformers for CrossAttention / CrossAttentionにxformersを使う")
@@ -3487,7 +3508,7 @@ def add_training_arguments(parser: argparse.ArgumentParser, support_dreambooth: 
         "--mixed_precision",
         type=str,
         default="no",
-        choices=["no", "fp16", "bf16"],
+        choices=["no", "fp16", "bf16", "fp8"],
         help="use mixed precision / 混合精度を使う場合、その精度",
     )
     parser.add_argument("--full_fp16", action="store_true", help="fp16 training including gradients / 勾配も含めてfp16で学習する")
@@ -4254,7 +4275,7 @@ def resume_from_local_or_hf_if_specified(accelerator, args):
 
 
 def get_optimizer(args, trainable_params):
-    # "Optimizer to use: AdamW, AdamW8bit, Lion, SGDNesterov, SGDNesterov8bit, PagedAdamW, PagedAdamW8bit, PagedAdamW32bit, Lion8bit, PagedLion8bit, DAdaptation(DAdaptAdamPreprint), DAdaptAdaGrad, DAdaptAdam, DAdaptAdan, DAdaptAdanIP, DAdaptLion, DAdaptSGD, Adafactor"
+    # "Optimizer to use: AdamW, AdamW8bit, Lion, SGDNesterov, SGDNesterov8bit, PagedAdamW, PagedAdamW8bit, PagedAdamW32bit, Lion8bit, PagedLion8bit, DAdaptation(DAdaptAdamPreprint), DAdaptAdaGrad, DAdaptAdam, DAdaptAdan, DAdaptAdanIP, DAdaptLion, DAdaptSGD, Adafactor, CAME"
 
     optimizer_type = args.optimizer_type
     if args.use_8bit_adam:
@@ -4315,6 +4336,15 @@ def get_optimizer(args, trainable_params):
             raise ImportError("No lion_pytorch / lion_pytorch がインストールされていないようです")
         logger.info(f"use Lion optimizer | {optimizer_kwargs}")
         optimizer_class = lion_pytorch.Lion
+        optimizer = optimizer_class(trainable_params, lr=lr, **optimizer_kwargs)
+
+    if optimizer_type == "CAME".lower():
+        try:
+            from came_pytorch import CAME
+        except ImportError:
+            raise ImportError("No CAME_pytorch / CAME_pytorch がインストールされていないようです")
+        logger.info(f"use CAME optimizer | {optimizer_kwargs}")
+        optimizer_class = CAME
         optimizer = optimizer_class(trainable_params, lr=lr, **optimizer_kwargs)
 
     elif optimizer_type.endswith("8bit".lower()):
@@ -4723,9 +4753,10 @@ def prepare_accelerator(args: argparse.Namespace):
                 wandb.login(key=args.wandb_api_key)
 
     # torch.compile のオプション。 NO の場合は torch.compile は使わない
-    dynamo_backend = "NO"
-    if args.torch_compile:
-        dynamo_backend = args.dynamo_backend
+    #dynamo_backend = "NO"
+    #if args.torch_compile:
+    #    dynamo_backend = args.dynamo_backend
+    dynamo_backend = args.dynamo_backend
 
     kwargs_handlers = (
         InitProcessGroupKwargs(timeout=datetime.timedelta(minutes=args.ddp_timeout)) if args.ddp_timeout else None,
@@ -4740,6 +4771,9 @@ def prepare_accelerator(args: argparse.Namespace):
     kwargs_handlers = list(filter(lambda x: x is not None, kwargs_handlers))
     deepspeed_plugin = deepspeed_utils.prepare_deepspeed_plugin(args)
 
+    if args.mixed_precision == "fp8":
+        kwargs_handlers.extend([FP8RecipeKwargs(backend="msamp", optimization_level="O2")])
+
     accelerator = Accelerator(
         gradient_accumulation_steps=args.gradient_accumulation_steps,
         mixed_precision=args.mixed_precision,
@@ -4747,9 +4781,9 @@ def prepare_accelerator(args: argparse.Namespace):
         project_dir=logging_dir,
         kwargs_handlers=kwargs_handlers,
         dynamo_backend=dynamo_backend,
-        deepspeed_plugin=deepspeed_plugin,
+        deepspeed_plugin=deepspeed_plugin
     )
-    print("accelerator device:", accelerator.device)
+    print("accelerator device:", accelerator.device, )
     return accelerator
 
 
@@ -5427,6 +5461,11 @@ def get_my_scheduler(
     *,
     sample_sampler: str,
     v_parameterization: bool,
+    num_train_timesteps=SCHEDULER_TIMESTEPS,
+    beta_start=SCHEDULER_LINEAR_START,
+    beta_end=SCHEDULER_LINEAR_END,
+    beta_schedule=SCHEDLER_SCHEDULE,
+    **kwargs
 ):
     sched_init_args = {}
     if sample_sampler == "ddim":
@@ -5458,11 +5497,12 @@ def get_my_scheduler(
     if v_parameterization:
         sched_init_args["prediction_type"] = "v_prediction"
 
+    passables = {"num_train_timesteps", "beta_start","beta_end","beta_schedule"}
     scheduler = scheduler_cls(
-        num_train_timesteps=SCHEDULER_TIMESTEPS,
-        beta_start=SCHEDULER_LINEAR_START,
-        beta_end=SCHEDULER_LINEAR_END,
-        beta_schedule=SCHEDLER_SCHEDULE,
+        num_train_timesteps=num_train_timesteps,
+        beta_start=beta_start,
+        beta_end=beta_end,
+        beta_schedule=beta_schedule,
         **sched_init_args,
     )
 
@@ -5546,6 +5586,7 @@ def sample_images_common(
     unet,
     prompt_replacement=None,
     controlnet=None,
+    **kwargs
 ):
     """
     StableDiffusionLongPromptWeightingPipelineの改造版を使うようにしたので、clip skipおよびプロンプトの重みづけに対応した
@@ -5600,6 +5641,11 @@ def sample_images_common(
     default_scheduler = get_my_scheduler(
         sample_sampler=args.sample_sampler,
         v_parameterization=args.v_parameterization,
+        #num_train_timesteps=kwargs["num_train_timesteps"],
+        #beta_start=kwargs["beta_start"],
+        #beta_end=kwargs["beta_end"],
+        #beta_schedule=kwargs["beta_schedule"]
+        **kwargs
     )
 
     pipeline = pipe_class(
@@ -5664,12 +5710,14 @@ def sample_images_common(
     # I'm not sure which of these is the correct way to clear the memory, but accelerator's device is used in the pipeline, so I'm using it here.
     # with torch.cuda.device(torch.cuda.current_device()):
     #     torch.cuda.empty_cache()
-    clean_memory_on_device(accelerator.device)
+    #clean_memory_on_device(accelerator.device)
 
     torch.set_rng_state(rng_state)
     if cuda_rng_state is not None:
         torch.cuda.set_rng_state(cuda_rng_state)
     vae.to(org_vae_device)
+    #doesn't this need to be after the vae shuffle?
+    clean_memory_on_device(accelerator.device)
 
 
 def sample_image_inference(
@@ -5837,3 +5885,29 @@ class LossRecorder:
     @property
     def moving_average(self) -> float:
         return self.loss_total / len(self.loss_list)
+
+class BucketedLossRecorder:
+    def __init__(self, bucketcount, maxtimestep=1000, mintimestep=0, decay=0.05, coldstart = 10):
+        self.bucketcount = bucketcount
+        self.bucket_list: List[float] = [0] * bucketcount
+        self.coldstart_period: List[int] = [coldstart] * bucketcount
+        self.coldstart_collector: List[float] = [0] * bucketcount
+        self.maxtimestep = maxtimestep
+        self.mintimestep = mintimestep
+        self.span = self.maxtimestep-self.mintimestep
+        self.bucketwidth = self.span / self.bucketcount
+        self.decay = decay
+
+    def bucketedema(self,idx,loss,decay):
+        self.bucket_list[idx] = self.bucket_list[idx]*(1-decay) + loss*self.decay
+
+    def bucketedwarmup(self,idx,loss):
+        self.coldstart_collector[idx] = self.coldstart_collector[idx] + loss
+        self.coldstart_period[idx] = self.coldstart_period[idx]-1
+        if coldstart_period[idx] < 0:
+            coldstart_period[idx] = 0
+
+    def bucketedcoldcheck(idx): return coldstart_period[idx] > 0
+
+    def bucketedaccumulate(self, timesteps, loss, decay):
+        idx = timesteps/self.bucketwidth

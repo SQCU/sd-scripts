@@ -18,7 +18,10 @@ from diffusers.pipelines.stable_diffusion import StableDiffusionPipelineOutput, 
 from diffusers.utils import logging
 from PIL import Image
 
-from library import sdxl_model_util, sdxl_train_util, train_util
+#from library import sdxl_model_util, sdxl_train_util, train_util
+#what if we simply deny this stupid module its stupid circular import?
+#what could possibly go wrong?
+#yeah this probably should never have been imported. since it's imported from sdxl_train_util, which imports train_util.
 
 
 try:
@@ -221,7 +224,10 @@ def get_hidden_states(text_encoder, input_ids, is_sdxl_text_encoder2: bool, eos_
         enc_out = text_encoder(input_ids.to(text_encoder.device), output_hidden_states=True, return_dict=True)
         hidden_states = enc_out["hidden_states"][-2]  # penuultimate layer
         # pool = enc_out["text_embeds"]
-        pool = train_util.pool_workaround(text_encoder, enc_out["last_hidden_state"], input_ids, eos_token_id)
+        # pool = train_util.pool_workaround(text_encoder, enc_out["last_hidden_state"], input_ids, eos_token_id)
+            # we suspect pool_workaround is already in context.
+        from library.train_util import pool_workaround
+        pool = pool_workaround(text_encoder, enc_out["last_hidden_state"], input_ids, eos_token_id)
     hidden_states = hidden_states.to(device)
     if pool is not None:
         pool = pool.to(device)
@@ -700,9 +706,9 @@ class SdxlStableDiffusionLongPromptWeightingPipeline:
             has_nsfw_concept = None
         return image, has_nsfw_concept
 
-    def decode_latents(self, latents):
+    def decode_latents(self, latents, scalefactor=0.13025): #why didn't you use A FUCKING ARGUMENT!!! WHAT IS SO BAD ABOUT OPERANDS!!!
         with torch.no_grad():
-            latents = 1 / sdxl_model_util.VAE_SCALE_FACTOR * latents
+            latents = 1 / scalefactor * latents
 
             # print("post_quant_conv dtype:", self.vae.post_quant_conv.weight.dtype)  # torch.float32
             # x = torch.nn.functional.conv2d(latents, self.vae.post_quant_conv.weight.detach(), stride=1, padding=0)
@@ -973,7 +979,10 @@ class SdxlStableDiffusionLongPromptWeightingPipeline:
         orig_size = torch.tensor([height, width]).repeat(batch_size * num_images_per_prompt, 1).to(dtype)
         crop_size = torch.zeros_like(orig_size)
         target_size = orig_size
-        embs = sdxl_train_util.get_size_embeddings(orig_size, crop_size, target_size, device).to(dtype)
+        #we suspect that sdxl_train_util is already in context.
+        #embs = sdxl_train_util.get_size_embeddings(orig_size, crop_size, target_size, device).to(dtype)
+        from library.sdxl_train_util import get_size_embeddings
+        embs = get_size_embeddings(orig_size, crop_size, target_size, device).to(dtype)
 
         # make conditionings
         if do_classifier_free_guidance:

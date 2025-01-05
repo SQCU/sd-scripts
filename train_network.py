@@ -37,6 +37,11 @@ from library.custom_train_functions import (
     add_v_prediction_like_loss,
     apply_debiased_estimation,
     apply_masked_loss,
+    apply_karras_edm_weighting,
+    apply_salimans_vpred_weighting,
+    apply_sigmoid_k_weighting,
+    nullify_implicit_v_lossweight,
+    slam_implicit_v_lossweight
 )
 from library.utils import setup_logging, add_logging_arguments
 
@@ -825,9 +830,14 @@ class NetworkTrainer:
 
         global_step = 0
 
-        noise_scheduler = DDPMScheduler(
-            beta_start=0.00085, beta_end=0.012, beta_schedule="scaled_linear", num_train_timesteps=1000, clip_sample=False
-        )
+        if args.sigmaximum_overdrive:
+            noise_scheduler = DDPMScheduler(
+                beta_start=0.00085, beta_end=0.012*math.sqrt(args.sigmaximum_overdrive/256), beta_schedule=args.beta_schedule, num_train_timesteps=1000, clip_sample=False
+            )
+        else:    
+            noise_scheduler = DDPMScheduler(
+                beta_start=0.00085, beta_end=0.012, beta_schedule=args.beta_schedule, num_train_timesteps=1000, clip_sample=False
+            )
         prepare_scheduler_for_custom_training(noise_scheduler, accelerator.device)
         if args.zero_terminal_snr:
             custom_train_functions.fix_noise_scheduler_betas_for_zero_terminal_snr(noise_scheduler)
@@ -986,11 +996,16 @@ class NetworkTrainer:
                     )
                     if args.masked_loss or ("alpha_masks" in batch and batch["alpha_masks"] is not None):
                         loss = apply_masked_loss(loss, batch)
-                    loss = loss.mean([1, 2, 3])
-
+                    loss = loss.mean([1, 2, 3]) #cannot find a single implementation that means before weighting.
+                    
                     loss_weights = batch["loss_weights"]  # 各sampleごとのweight
                     loss = loss * loss_weights
+                    
 
+                    if args.nullify_implicit_v_lossweight:  #unlike other loss weights this is a mix and match. go wild!
+                        loss = nullify_implicit_v_lossweight(loss, timesteps, noise_scheduler, args.v_parameterization)
+                    if args.slam_implicit_v_lossweight:  #unlike other loss weights this is a mix and match. go wild!
+                        loss = slam_implicit_v_lossweight(loss, timesteps, noise_scheduler, args.v_parameterization)
                     if args.min_snr_gamma:
                         loss = apply_snr_weight(loss, timesteps, noise_scheduler, args.min_snr_gamma, args.v_parameterization)
                     if args.scale_v_pred_loss_like_noise_pred:
@@ -998,7 +1013,14 @@ class NetworkTrainer:
                     if args.v_pred_like_loss:
                         loss = add_v_prediction_like_loss(loss, timesteps, noise_scheduler, args.v_pred_like_loss)
                     if args.debiased_estimation_loss:
-                        loss = apply_debiased_estimation(loss, timesteps, noise_scheduler)
+                        loss = apply_debiased_estimation(loss, timesteps, noise_scheduler, args.v_parameterization )
+                    if args.karras_edm_loss:
+                        loss = apply_karras_edm_weighting(loss, timesteps, noise_scheduler)    
+                    if args.salimans_vpred_weighting:
+                        loss = apply_salimans_vpred_weighting(loss, timesteps, noise_scheduler, args.v_parameterization)
+                    if args.sigmoid_k_weighting:
+                        loss = apply_sigmoid_k_weighting(loss, timesteps, noise_scheduler, args.v_parameterization, args.sigmoid_k_weighting)
+                    
 
                     loss = loss.mean()  # 平均なのでbatch_sizeで割る必要なし
 

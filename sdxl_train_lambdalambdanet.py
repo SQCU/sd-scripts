@@ -17,7 +17,9 @@ init_ipex()
 
 from accelerate.utils import set_seed, FP8RecipeKwargs
 from diffusers import DDPMScheduler
-from library import deepspeed_utils, sdxl_model_util
+#from library import deepspeed_utils, sdxl_model_util
+from library import deepspeed_utils 
+from library import sdxl_model_util_lambdalambdanet
 
 import library.train_util as train_util
 
@@ -29,7 +31,8 @@ import logging
 logger = logging.getLogger(__name__)
 
 import library.config_util as config_util
-import library.sdxl_train_util as sdxl_train_util
+#import library.sdxl_train_util as sdxl_train_util
+import library.sdxl_train_util_lambdalambdanet as sdxl_train_util
 from library.config_util import (
     ConfigSanitizer,
     BlueprintGenerator,
@@ -48,7 +51,9 @@ from library.custom_train_functions import (
     nullify_implicit_v_lossweight,
     slam_implicit_v_lossweight
 )
-from library.sdxl_original_unet import SdxlUNet2DConditionModel
+#from library.sdxl_original_unet import SdxlUNet2DConditionModel
+#from library.sdxl_original_unet_skiplambda import SdxlUNet2DConditionModel
+from library.sdxl_original_unet_skiplambdalambda import SdxlUNet2DConditionModel
 
 
 UNET_NUM_BLOCKS_FOR_BLOCK_LR = 23
@@ -100,6 +105,102 @@ def get_norm_params(unet: SdxlUNet2DConditionModel):     #you would never believ
 
     return prosaic_params, norming_params
 
+"""
+def get_named_params(unet: SdxlUNet2DConditionModel , namestring: str,  mask = None):
+    mask_set = set()
+    if mask:
+        mask_set = mask_set | set(mask) #please dont try and get tricky and pipe sets into this like cmon
+    prosaic_params = set()
+    perspicacious_params = set()
+    namestring = namestring.lower() # we aren't caseing where we're going
+
+    for i, (name, param) in enumerate(unet.named_parameters()):
+        if namestring in name.lower():
+            perspicacious_params.add(param)
+            if param in mask_set:
+                accelerator.print(f"{param} was pluck't but in mask_set.")
+        else:
+            prosaic_params.add(param)
+    #feel like there's probably a better way, but i'm sleepy,
+    # peels list to 2 lists, perspicacious (useful), prosaic (unselected).
+    return list(prosaic_params), list(perspicacious_params)
+"""
+def get_named_params(unet: SdxlUNet2DConditionModel , namestring: str):
+    prosaic_params = []
+    perspicacious_params = []
+    def unet_nameyoink(name, checkstring):
+        #check = namestring.lower()
+        check = namestring#.lower()
+        return check in name#.lower()
+        
+    for i, (name, param) in enumerate(unet.named_parameters()):
+        if unet_nameyoink(name, checkstring=namestring):
+            perspicacious_params.append(param)
+        else:
+            prosaic_params.append(param)
+
+    return prosaic_params, perspicacious_params
+
+"""
+def we_take_bias_removal_seriously_here(self):
+    bounds = self.ab_bounds
+    if self.incremental_abolish:
+        for b in self.norm1.bias.data:
+                b = self.beta_clampy(b,self.incremental_abolish,**bounds)
+        for b in self.norm2.bias.data:
+                b = self.beta_clampy(b,self.incremental_abolish,**bounds)
+        for b in self.norm3.bias.data:
+                b = self.beta_clampy(b,self.incremental_abolish,**bounds)
+            self.incremental_abolish += 0.01
+        if self.incremental_abolish >= 1:
+                self.incremental_abolish = False
+    elif self.bias_abolisher:
+        for b in self.norm1.bias.data:
+            b = self.nonbeta_clampy(b,**bounds)
+"""
+def bias_yoinkems(unet, affinenormbiases=[]):
+    usd = unet.state_dict()
+    bvalues = {affinenormbias:usd[affinenormbias] for affinenormbias in affinenormbiases}
+    #enumerated = enumerate([usd[str(bvalue)] for bvalue in bvalues.keys()])
+    tiniest = min(torch.min(bvalues[bkey]) for bkey in bvalues.keys())
+    biggest = max(torch.max(bvalues[bkey]) for bkey in bvalues.keys())
+    #return min(enumerate([bvalue for bvalue in unet[str(affinenormbiases+".data")]]))
+    return tiniest, biggest
+
+def beta_clampy(term_for_clampy, beta, mink=None, maxk=None):
+    return torch.clamp(term_for_clampy,min=mink, max=maxk)*beta + (1-beta)*term_for_clampy
+def nonbeta_clampy(term_for_clampy, mink=None, maxk=None):
+    #return torch.clamp_(term_for_clampy,min=mink, max=maxk)
+    torch.clamp_(term_for_clampy,min=mink, max=maxk)
+
+def cleanup(unet:SdxlUNet2DConditionModel, affinenormbiases=[], learnedlambdas=[], incremental_abolish=None):
+    # we want norm123.bias.data
+    usd = unet.state_dict()
+    def continuous_abolisher(unet:SdxlUNet2DConditionModel, affinenormbiases=[], incremental_abolish=[]):
+        for bias in affinenormbiases:
+            if incremental_abolish:
+                usd[str(bias)] = beta_clampy(usd[str(bias)], incremental_abolish[0], mink=0, maxk=2)
+            else:
+                nonbeta_clampy(usd[str(bias)], mink=0, maxk=2)
+        
+        if incremental_abolish:
+            incremental_abolish[0] = incremental_abolish[0]+0.01    #its so funny having to write an iterator in pydiom.
+            if incremental_abolish[0] >= 1:
+                incremental_abolish.clear()
+
+    def lambda_clampbda(unet:SdxlUNet2DConditionModel, learnedlambdas=[]):
+        for lambdas in learnedlambdas:
+            #unet[str(lambdas+".data")] = torch.clamp_(unet[str(lambdas+".data")], min=1e-2, max=2.0)
+            lambdas.data = torch.clamp(lambdas.data, min=1e-2, max=2.0)
+            #migrating clamp action here because of suspicions about forwards pass calculation time.
+
+    """
+    def cleanup(self):
+        self.continuous_abolisher(unet, affinenormbiases=affinenormbiases)
+        self.lambda_clampbda(unet, learnedlambdas=learnedlambdas)
+    """
+    continuous_abolisher(unet, affinenormbiases=affinenormbiases, incremental_abolish=incremental_abolish)
+    lambda_clampbda(unet, learnedlambdas=learnedlambdas)
 
 def append_block_lr_to_logs(block_lrs, logs, lr_scheduler, optimizer_type):
     names = []
@@ -123,13 +224,17 @@ def append_block_lr_to_logs(block_lrs, logs, lr_scheduler, optimizer_type):
 def train(args):
     train_util.verify_training_args(args)
     train_util.prepare_dataset_args(args, True)
-    sdxl_train_util.verify_sdxl_training_args(args)
+    #sdxl_train_util.verify_sdxl_training_args(args)
+    #no this is stupid why is this even a method.
     deepspeed_utils.prepare_deepspeed_args(args)
     setup_logging(args, reset=True)
 
     norm_params = None
     clippables = None
     global_optim_man = None
+    skipweight_params = []
+    affinenormbiases= []
+    incremental_abolish= []
 
     assert (
         not args.weighted_captions
@@ -233,6 +338,14 @@ def train(args):
     weight_dtype, save_dtype = train_util.prepare_dtype(args)
     vae_dtype = torch.float32 if args.no_half_vae else weight_dtype
 
+    funkyfucker = {}
+    """
+    if args.bias_abolisher:
+        funkyfucker["bias_abolisher"] = args.bias_abolisher
+    if args.incremental_abolish:
+        funkyfucker["incremental_abolish"] = args.incremental_abolish
+    """
+
     # モデルを読み込む
     (
         load_stable_diffusion_format,
@@ -242,7 +355,9 @@ def train(args):
         unet,
         logit_scale,
         ckpt_info,
-    ) = sdxl_train_util.load_target_model(args, accelerator, "sdxl", weight_dtype)
+    ) = sdxl_train_util.load_target_model(args, accelerator, "sdxl", weight_dtype)# , initdict=funkyfucker)
+    #add funkyfucker dict here. 
+
     # logit_scale = logit_scale.to(accelerator.device, dtype=weight_dtype)
 
     # verify load/save model formats
@@ -367,6 +482,21 @@ def train(args):
     if args.norm_salvation:
         clippables, norm_params = get_norm_params(unet)
         #norm_params.requires_grad_(True)
+    #if args.skipl_salv: #i guess other training processes use these now as well
+    clippables_beta, skipweight_params = get_named_params(unet=unet, namestring="learnedlambda") # mask=norm_params)
+    if clippables:
+        clippables = set(clippables) - set(clippables_beta)
+        clippables = list(clippables)
+    else:
+        clippables = clippables_beta
+        #norm_params.requires_grad_(True)
+    if args.bias_abolisher:
+        for name, param in unet.named_parameters():
+            if 'norm1' in name or 'norm2' in name or 'norm3' in name:
+                if 'bias' in name:
+                    affinenormbiases.append(name)
+    if args.incremental_abolish:
+        incremental_abolish.append(args.incremental_abolish)
 
     if train_text_encoder1:
         training_models.append(text_encoder1)
@@ -388,6 +518,10 @@ def train(args):
     if args.norm_salvation:
         for nnp in clippables:
             n_notnorm_params += nnp.numel()
+    n_skipweight_params = 0
+    if args.skipl_salv:
+        for nsp in skipweight_params:
+            n_skipweight_params += nsp.numel()
 
     accelerator.print(f"train unet: {train_unet}, text_encoder1: {train_text_encoder1}, text_encoder2: {train_text_encoder2}")
     accelerator.print(f"number of models: {len(training_models)}")
@@ -395,9 +529,12 @@ def train(args):
     if args.norm_salvation:
         accelerator.print(f"number of split norm parameters: {n_norm_params}")
         accelerator.print(f"number of split non-norm parameters: {n_notnorm_params}\nplease be {n_params-n_norm_params}.")
-
+    if args.skipl_salv:
+        accelerator.print(f"number of split skipweight parameters: {n_skipweight_params}\nplease be {n_params-n_skipweight_params}.")
     # 学習に必要なクラスを準備する
     accelerator.print("prepare optimizer, data loader etc.")
+    if args.bias_abolisher:
+        accelerator.print(f"biasminmax:{bias_yoinkems(unet=unet,affinenormbiases=affinenormbiases)}")
 
     if args.fused_optimizer_groups:
         # fused backward pass: https://pytorch.org/tutorials/intermediate/optimizer_step_in_backward_tutorial.html
@@ -455,7 +592,16 @@ def train(args):
                 norms_kv["lr"]=args.layernorm_lr
             #global_optim_man=optimizer.mng
             optimizer.mng.override_config(parameters=norm_params, key_value_dict=norms_kv)
-            logger.info(f"using {norms_kv} overrides to optimizer config.")
+            logger.info(f"using {norms_kv} overrides to layernorm optimizer config.")
+        if args.skipl_salv:
+            lskip_kv ={"weight_decay":args.skipl_decay}
+            if args.skipl_adambetas is not None:
+                lskip_kv["betas"]=tuple(args.skipl_adambetas)
+            if args.layernorm_lr is not None:
+                lskip_kv["lr"]=args.skipl_lr
+            optimizer.mng.override_config(parameters=skipweight_params, key_value_dict=lskip_kv)
+            logger.info(f"using {lskip_kv} overrides to skipweight optimizer config.")
+
 
     # dataloaderを準備する
     # DataLoaderのプロセス数：0 は persistent_workers が使えないので注意
@@ -585,11 +731,12 @@ def train(args):
 
     # resumeする
     train_util.resume_from_local_or_hf_if_specified(accelerator, args)
-
+    """
     if args.clamp_grad_value: #i shuppose --clip_grad_norm 0.0 evaluates to falsy.
         for param_group in optimizer.param_groups:
             for parameter.requires_grad in param_group["params"]:
                 parameter.register_hook(lambda grad: torch.clamp(grad, -clamp_grad_value, clamp_grad_value))
+    """
 
     if args.fused_backward_pass:
         # use fused optimizer for backward pass: other optimizers will be supported in the future
@@ -637,6 +784,13 @@ def train(args):
                             if optimizer_hooked_count[i] == num_parameters_per_group[i]:
                                 optimizers[i].step()
                                 optimizers[i].zero_grad(set_to_none=True)
+                                #if args.bias_abolisher:
+                                """ emergency holdout for bullying accelerator into working how e want it
+                                for model in accelerator._models:
+                                    cleanup(model, affinenormbiases=affinenormbiases, learnedlambdas=skipweight_params)
+                                """
+                                cleanup(unet, affinenormbiases=affinenormbiases, learnedlambdas=skipweight_params) 
+                                # i think this is where you slap the abolisher?
 
                         parameter.register_post_accumulate_grad_hook(optimizer_hook)
                         parameter_optimizer_map[parameter] = opt_idx
@@ -692,7 +846,8 @@ def train(args):
 
     # For --sample_at_first
     sdxl_train_util.sample_images(
-        accelerator, args, 0, global_step, accelerator.device, vae, [tokenizer1, tokenizer2], [text_encoder1, text_encoder2], unet
+        accelerator, args, 0, global_step, accelerator.device, vae, [tokenizer1, tokenizer2], [text_encoder1, text_encoder2], unet,
+        beta_start = noise_scheduler.beta_start, beta_end = noise_scheduler.beta_end, beta_schedule = noise_scheduler.beta_schedule
     )
 
     loss_recorder = train_util.LossRecorder()
@@ -721,7 +876,7 @@ def train(args):
                         if torch.any(torch.isnan(latents)):
                             accelerator.print("NaN found in latents, replacing with zeros")
                             latents = torch.nan_to_num(latents, 0, out=latents)
-                latents = latents * sdxl_model_util.VAE_SCALE_FACTOR
+                latents = latents * sdxl_model_util_lambdalambdanet.VAE_SCALE_FACTOR
 
                 if "text_encoder_outputs1_list" not in batch or batch["text_encoder_outputs1_list"] is None:
                     input_ids1 = batch["input_ids"]
@@ -872,10 +1027,21 @@ def train(args):
                             params_to_clip = []
                             params_to_clip.extend(norm_params)
                             accelerator.clip_grad_norm_(params_to_clip, args.layernorm_gradient_clipping)
+                        if args.skipl_gradient_clipping:
+                            params_to_clip = []
+                            params_to_clip.extend(skipweight_params)
+                            accelerator.clip_grad_norm_(params_to_clip, args.skipl_gradient_clipping)
 
                     optimizer.step()
                     lr_scheduler.step()
                     optimizer.zero_grad(set_to_none=True)
+                    #if args.bias_abolisher:
+                    """ emergency holdout for bullying accelerator into working how e want it
+                    for model in accelerator._models:
+                        cleanup(model, affinenormbiases=affinenormbiases, learnedlambdas=skipweight_params)
+                    """
+                    cleanup(unet, affinenormbiases=affinenormbiases, learnedlambdas=skipweight_params) # i think this is where you slap the abolisher?
+                    
                 else:
                     # optimizer.step() and optimizer.zero_grad() are called in the optimizer hook
                     lr_scheduler.step()
@@ -898,6 +1064,9 @@ def train(args):
                     [tokenizer1, tokenizer2],
                     [text_encoder1, text_encoder2],
                     unet,
+                    beta_start = noise_scheduler.beta_start,
+                    beta_end = noise_scheduler.beta_end,
+                    beta_schedule = noise_scheduler.beta_schedule
                 )
 
                 # 指定ステップごとにモデルを保存
@@ -923,6 +1092,8 @@ def train(args):
                             logit_scale,
                             ckpt_info,
                         )
+                        if args.bias_abolisher:
+                            accelerator.print(f"onsave biasminmax:{bias_yoinkems(unet=unet,affinenormbiases=affinenormbiases)}")
 
             current_loss = loss.detach().item()  # 平均なのでbatch sizeは関係ないはず
             if args.logging_dir is not None:
@@ -969,6 +1140,8 @@ def train(args):
                     logit_scale,
                     ckpt_info,
                 )
+                if args.bias_abolisher:
+                    accelerator.print(f"onsave biasminmax:{bias_yoinkems(unet=unet,affinenormbiases=affinenormbiases)}")
 
         sdxl_train_util.sample_images(
             accelerator,
@@ -980,6 +1153,9 @@ def train(args):
             [tokenizer1, tokenizer2],
             [text_encoder1, text_encoder2],
             unet,
+            beta_start = noise_scheduler.beta_start,
+            beta_end = noise_scheduler.beta_end,
+            beta_schedule = noise_scheduler.beta_schedule
         )
 
     is_main_process = accelerator.is_main_process
@@ -989,6 +1165,8 @@ def train(args):
     text_encoder2 = accelerator.unwrap_model(text_encoder2)
 
     accelerator.end_training()
+    if args.bias_abolisher:
+        accelerator.print(f"trainendbiasminmax:{bias_yoinkems(unet=unet,affinenormbiases=affinenormbiases)}")
 
     if args.save_state or args.save_state_on_train_end:
         train_util.save_state_on_train_end(args, accelerator)
@@ -1095,6 +1273,49 @@ def setup_parser() -> argparse.ArgumentParser:
         type=float,
         default=None,
         help="pass 1 lr vlues.",
+    )
+    parser.add_argument(
+        "--skipl_salv",
+        action="store_true",
+        default=None,
+        help="peel apart skiplambda params",
+    )
+    parser.add_argument(
+        "--skipl_gradient_clipping",
+        type=float,
+        default=None,
+        help="then constrain the skiplambda gradients anyways.",
+    )
+    parser.add_argument(
+        "--skipl_decay",
+        type=float,
+        default=0.0,
+        help="then decay the skiplambda gradients anyways.",
+    )
+    parser.add_argument(
+        "--skipl_adambetas",
+        nargs=2,
+        type=float,
+        default=None,
+        help="pass 2 space separated beta1 and beta2 vlues.",
+    )
+    parser.add_argument(
+        "--skipl_lr",
+        type=float,
+        default=None,
+        help="pass 1 lr vlues.",
+    )
+    parser.add_argument(
+        "--bias_abolisher",
+        action="store_true",
+        default=None,
+        help="get rid of layernorm biases.",
+    )
+    parser.add_argument(
+        "--incremental_abolish",
+        type=float,
+        default=None,
+        help="interpolation term between clamped and nonclamped layernorm biases. pick something between 0.01 and 0.9.",
     )
     return parser
 

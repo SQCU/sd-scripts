@@ -32,6 +32,7 @@ from library.custom_train_functions import (
     add_v_prediction_like_loss,
     apply_debiased_estimation,
     apply_masked_loss,
+    slam_implicit_v_lossweight
 )
 from library.utils import setup_logging, add_logging_arguments
 
@@ -496,9 +497,14 @@ class TextualInversionTrainer:
         progress_bar = tqdm(range(args.max_train_steps), smoothing=0, disable=not accelerator.is_local_main_process, desc="steps")
         global_step = 0
 
-        noise_scheduler = DDPMScheduler(
-            beta_start=0.00085, beta_end=0.012, beta_schedule="scaled_linear", num_train_timesteps=1000, clip_sample=False
-        )
+        if args.sigmaximum_overdrive:
+            noise_scheduler = DDPMScheduler(
+                beta_start=0.00085, beta_end=0.012*math.sqrt(args.sigmaximum_overdrive/256), beta_schedule=args.beta_schedule, num_train_timesteps=1000, clip_sample=False
+            )
+        else:    
+            noise_scheduler = DDPMScheduler(
+                beta_start=0.00085, beta_end=0.012, beta_schedule=args.beta_schedule, num_train_timesteps=1000, clip_sample=False
+            )
         prepare_scheduler_for_custom_training(noise_scheduler, accelerator.device)
         if args.zero_terminal_snr:
             custom_train_functions.fix_noise_scheduler_betas_for_zero_terminal_snr(noise_scheduler)
@@ -604,6 +610,8 @@ class TextualInversionTrainer:
                         loss = add_v_prediction_like_loss(loss, timesteps, noise_scheduler, args.v_pred_like_loss)
                     if args.debiased_estimation_loss:
                         loss = apply_debiased_estimation(loss, timesteps, noise_scheduler)
+                    if args.slam_implicit_v_lossweight:
+                        loss = slam_implicit_v_lossweight(loss, timesteps, noise_scheduler)
 
                     loss = loss.mean()  # 平均なのでbatch_sizeで割る必要なし
 

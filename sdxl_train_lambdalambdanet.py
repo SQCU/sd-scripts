@@ -400,6 +400,10 @@ def train(args):
         if torch.__version__ >= "2.0.0":  # PyTorch 2.0.0 以上対応のxformersなら以下が使える
             vae.set_use_memory_efficient_attention_xformers(args.xformers)
 
+    if args.use_laser_sdpa:
+        logger.info("Enable LAZER-SDPA for U-Net")
+        unet.set_use_laser_sdpa(True)
+
     # 学習を準備する
     if cache_latents:
         vae.to(accelerator.device, dtype=vae_dtype)
@@ -1316,6 +1320,12 @@ def setup_parser() -> argparse.ArgumentParser:
         type=float,
         default=None,
         help="interpolation term between clamped and nonclamped layernorm biases. pick something between 0.01 and 0.9.",
+    )
+    parser.add_argument(
+        "--use_laser_sdpa",
+        action="store_true",
+        default=None,
+        help="rescale those numbers",
     )
     return parser
 

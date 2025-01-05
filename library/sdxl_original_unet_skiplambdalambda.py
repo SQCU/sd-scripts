@@ -329,8 +329,6 @@ class ResnetBlock2D(nn.Module):
         self.learnedlambda1 = nn.Parameter(torch.tensor(0.95))
 
     def forward_body(self, x, emb):
-        #self.learnedlambda1.data = torch.clamp(self.learnedlambda1.data, min=1e-2, max=2.0)
-        #migrate to cleanup()?
         h = self.in_layers(x)
         emb_out = self.emb_layers(emb).type(h.dtype)
         h = h + emb_out[:, :, None, None]
@@ -420,6 +418,7 @@ class CrossAttention(nn.Module):
         self.use_memory_efficient_attention_xformers = False
         self.use_memory_efficient_attention_mem_eff = False
         self.use_sdpa = False
+        self.use_laser_sdpa = False
 
     def set_use_memory_efficient_attention(self, xformers, mem_eff):
         self.use_memory_efficient_attention_xformers = xformers
@@ -427,6 +426,9 @@ class CrossAttention(nn.Module):
 
     def set_use_sdpa(self, sdpa):
         self.use_sdpa = sdpa
+
+    def set_use_laser_sdpa(self, pewpew: bool):
+        self.use_laser_sdpa = pewpew
 
     def reshape_heads_to_batch_dim(self, tensor):
         batch_size, seq_len, dim = tensor.shape
@@ -447,6 +449,8 @@ class CrossAttention(nn.Module):
             return self.forward_memory_efficient_xformers(hidden_states, context, mask)
         if self.use_memory_efficient_attention_mem_eff:
             return self.forward_memory_efficient_mem_eff(hidden_states, context, mask)
+        if self.use_laser_sdpa: #and self.use_sdpa:
+            return self.laser_preattn_sdpa(hidden_states, context, mask)
         if self.use_sdpa:
             return self.forward_sdpa(hidden_states, context, mask)
 
@@ -556,6 +560,38 @@ class CrossAttention(nn.Module):
         out = self.to_out[0](out)
         return out
 
+    def laser_preattn_sdpa(self, x, context=None, mask=None):
+        #stock impl
+        h = self.heads
+        q_in = self.to_q(x)
+        context = context if context is not None else x
+        context = context.to(x.dtype)
+        k_in = self.to_k(context)
+        v_in = self.to_v(context)
+        
+        #laser
+        #valueoffset_biggymax = torch.max(v_in, keepdim=True)
+        valueoffset_biggymax = torch.max(v_in)
+        #valueoffset_biggymax.requires_grad_(False) #sure hope this works like in the jax model
+        #haha nope it didn't
+        #valueoffset_biggymax.no_grad()
+        valueoffset_biggymax = valueoffset_biggymax.detach() #this one might be more wasteful in memory?
+        v_exp_in = torch.exp(v_in - valueoffset_biggymax)   #scale, shift
+
+        q, k, v = map(lambda t: rearrange(t, "b n (h d) -> b h n d", h=h), (q_in, k_in, v_exp_in))
+        del q_in, k_in, v_in, v_exp_in
+
+        #stock impl
+        out = F.scaled_dot_product_attention(q, k, v, attn_mask=mask, dropout_p=0.0, is_causal=False)
+        out = rearrange(out, "b h n d -> b n (h d)", h=h)
+
+        #laser descale, deshift
+        out = torch.log(out) + valueoffset_biggymax
+        del valueoffset_biggymax
+
+        #stock impl... feedforward?
+        out = self.to_out[0](out)
+        return out
 
 # feedforward
 class GEGLU(nn.Module):
@@ -606,22 +642,16 @@ class FeedForward(nn.Module):
 
 class BasicTransformerBlock(nn.Module):
     def __init__(
-        self, dim: int, num_attention_heads: int, attention_head_dim: int, cross_attention_dim: int, upcast_attention: bool = False, #bias_abolisher = False, incremental_abolish = False
+        self, dim: int, num_attention_heads: int, attention_head_dim: int, cross_attention_dim: int, upcast_attention: bool = False
     ):
         super().__init__()
 
         self.gradient_checkpointing = False
-        self.bias_abolisher = bias_abolisher 
-        self.incremental_abolish = incremental_abolish
-        #if self.incremental_abolish:
-        #    self.ab_bounds = {"mink":0, "maxk":2}
-        #incremental is a beta term. be good now.
 
         #UH OH LOOK OUT IT'S THE FAL-AI IMPLEMENTATION OF A LEARNABLE LAMBDA AWOOGA AWOOGA {MEL BLANC NOISES}.
         #actually the fal-AI implementation is really bad idk why they're putting two lambda terms in there.
         #seriously why two i do not understand.
-        #if self.learnedlambda1 is None:
-        self.learnedlambda1 = nn.Parameter(torch.tensor(0.85))
+        self.learnedlambda1 = nn.Parameter(torch.tensor(0.85))#this init is arbitrary
 
         # 1. Self-Attn
         self.attn1 = CrossAttention(
@@ -648,33 +678,6 @@ class BasicTransformerBlock(nn.Module):
         # 3. Feed-forward
         self.norm3 = nn.LayerNorm(dim)
 
-    """
-    def beta_clampy(self, term_for_clampy, beta, mink=None, maxk=None):
-        return torch.clamp(term_for_clampy,min=mink, max=maxk)*beta + (1-beta)*term_for_clampy
-    def nonbeta_clampy(self, term_for_clampy, mink=None, maxk=None):
-        return torch.clamp(term_for_clampy,min=mink, max=maxk)
-    """
-    """
-    def we_take_bias_removal_seriously_here(self):
-        bounds = self.ab_bounds
-        if self.incremental_abolish:
-            for b in self.norm1.bias.data:
-                b = self.beta_clampy(b,self.incremental_abolish,**bounds)
-            for b in self.norm2.bias.data:
-                b = self.beta_clampy(b,self.incremental_abolish,**bounds)
-            for b in self.norm3.bias.data:
-                b = self.beta_clampy(b,self.incremental_abolish,**bounds)
-            self.incremental_abolish += 0.01
-            if self.incremental_abolish >= 1:
-                self.incremental_abolish = False
-        elif self.bias_abolisher:
-            for b in self.norm1.bias.data:
-                b = self.nonbeta_clampy(b,**bounds)
-            for b in self.norm2.bias.data:
-                b = self.nonbeta_clampy(b,**bounds)
-            for b in self.norm3.bias.data:
-                b = self.nonbeta_clampy(b,**bounds)
-    """
     def set_use_memory_efficient_attention(self, xformers: bool, mem_eff: bool):
         self.attn1.set_use_memory_efficient_attention(xformers, mem_eff)
         self.attn2.set_use_memory_efficient_attention(xformers, mem_eff)
@@ -683,11 +686,11 @@ class BasicTransformerBlock(nn.Module):
         self.attn1.set_use_sdpa(sdpa)
         self.attn2.set_use_sdpa(sdpa)
 
+    def set_use_laser_sdpa(self, pewpew: bool):
+        self.attn1.set_use_laser_sdpa(pewpew)
+        self.attn2.set_use_laser_sdpa(pewpew)
+
     def forward_body(self, hidden_states, context=None, timestep=None):
-        #if self.bias_abolisher:
-        #    self.we_take_bias_removal_seriously_here()
-        # this maybe can't go here to work with gradient checkpointing!
-        
         # 1. Self-Attention
         norm_hidden_states = self.norm1(hidden_states)
 
@@ -699,9 +702,6 @@ class BasicTransformerBlock(nn.Module):
 
         # 3. Feed-forward
         #hidden_states = self.ff(self.norm3(hidden_states)) + hidden_states
-        #extremely suspicious nickcdryan implementation of learned skip connection values
-        #self.learnedlambda1.data = torch.clamp(self.learnedlambda1.data, min=1e-2, max=2.0)
-        #migrate to cleanup()?
         hidden_states = self.ff(self.norm3(hidden_states)) + self.learnedlambda1*hidden_states
 
         return hidden_states
@@ -734,8 +734,7 @@ class Transformer2DModel(nn.Module):
         cross_attention_dim: Optional[int] = None,
         use_linear_projection: bool = False,
         upcast_attention: bool = False,
-        num_transformer_layers: int = 1,
-        #bias_abolisher = False, incremental_abolish = False
+        num_transformer_layers: int = 1
     ):
         super().__init__()
         self.in_channels = in_channels
@@ -761,9 +760,7 @@ class Transformer2DModel(nn.Module):
                     num_attention_heads,
                     attention_head_dim,
                     cross_attention_dim=cross_attention_dim,
-                    upcast_attention=upcast_attention,
-                    bias_abolisher = bias_abolisher,
-                    #incremental_abolish = incremental_abolish
+                    upcast_attention=upcast_attention
                 )
             )
 
@@ -784,10 +781,12 @@ class Transformer2DModel(nn.Module):
         for transformer in self.transformer_blocks:
             transformer.set_use_sdpa(sdpa)
 
+    def set_use_laser_sdpa(self, pewpew):
+        for transformer in self.transformer_blocks:
+            transformer.set_use_laser_sdpa(pewpew)
+
     def forward(self, hidden_states, encoder_hidden_states=None, timestep=None):
         # 1. Input
-        #self.learnedlambda1.data = torch.clamp(self.learnedlambda1.data, min=1e-2, max=2.0)
-        #migrate to cleanup()?
         batch, _, height, weight = hidden_states.shape
         residual = hidden_states
 
@@ -833,9 +832,12 @@ class Upsample2D(nn.Module):
         # Cast to float32 to as 'upsample_nearest2d_out_frame' op does not support bfloat16
         # TODO(Suraj): Remove this cast once the issue is fixed in PyTorch
         # https://github.com/pytorch/pytorch/issues/86679
+        # fixed in ptorch 2.1 https://github.com/pytorch/pytorch/issues/86679#issuecomment-1783978767
+        """
         dtype = hidden_states.dtype
         if dtype == torch.bfloat16:
             hidden_states = hidden_states.to(torch.float32)
+        """
 
         # upsample_nearest_nhwc fails with large batch sizes. see https://github.com/huggingface/diffusers/issues/984
         if hidden_states.shape[0] >= 64:
@@ -848,10 +850,12 @@ class Upsample2D(nn.Module):
             hidden_states = F.interpolate(hidden_states, size=output_size, mode="nearest")
 
         # If the input is bfloat16, we cast back to bfloat16
+        """ #upcast and downcast obsolete in ptorch 2.1
         if dtype == torch.bfloat16:
             hidden_states = hidden_states.to(dtype)
 
         hidden_states = self.conv(hidden_states)
+        """
 
         return hidden_states
 
@@ -879,7 +883,6 @@ class SdxlUNet2DConditionModel(nn.Module):
 
     def __init__(
         self,
-        #bias_abolisher = False, incremental_abolish = False,
         **kwargs
         
     ):
@@ -951,8 +954,7 @@ class SdxlUNet2DConditionModel(nn.Module):
                     in_channels=2 * self.model_channels,
                     num_transformer_layers=2,
                     use_linear_projection=True,
-                    cross_attention_dim=2048,
-                    #bias_abolisher = bias_abolisher, incremental_abolish = incremental_abolish
+                    cross_attention_dim=2048
                 ),
             ]
             self.input_blocks.append(nn.ModuleList(layers))
@@ -979,8 +981,7 @@ class SdxlUNet2DConditionModel(nn.Module):
                     in_channels=4 * self.model_channels,
                     num_transformer_layers=10,
                     use_linear_projection=True,
-                    cross_attention_dim=2048,
-                    #bias_abolisher = bias_abolisher, incremental_abolish = incremental_abolish
+                    cross_attention_dim=2048
                 ),
             ]
             self.input_blocks.append(nn.ModuleList(layers))
@@ -998,8 +999,7 @@ class SdxlUNet2DConditionModel(nn.Module):
                     in_channels=4 * self.model_channels,
                     num_transformer_layers=10,
                     use_linear_projection=True,
-                    cross_attention_dim=2048,
-                    #bias_abolisher = bias_abolisher, incremental_abolish = incremental_abolish
+                    cross_attention_dim=2048
                 ),
                 ResnetBlock2D(
                     in_channels=4 * self.model_channels,
@@ -1024,8 +1024,7 @@ class SdxlUNet2DConditionModel(nn.Module):
                     in_channels=4 * self.model_channels,
                     num_transformer_layers=10,
                     use_linear_projection=True,
-                    cross_attention_dim=2048,
-                    #bias_abolisher = bias_abolisher, incremental_abolish = incremental_abolish
+                    cross_attention_dim=2048
                 ),
             ]
             if i == 2:
@@ -1051,8 +1050,7 @@ class SdxlUNet2DConditionModel(nn.Module):
                     in_channels=2 * self.model_channels,
                     num_transformer_layers=2,
                     use_linear_projection=True,
-                    cross_attention_dim=2048,
-                    #bias_abolisher = bias_abolisher, incremental_abolish = incremental_abolish
+                    cross_attention_dim=2048
                 ),
             ]
             if i == 2:
@@ -1124,6 +1122,13 @@ class SdxlUNet2DConditionModel(nn.Module):
                 if hasattr(module, "set_use_sdpa"):
                     module.set_use_sdpa(sdpa)
 
+    def set_use_laser_sdpa(self, pewpew: bool) -> None:
+        blocks = self.input_blocks + [self.middle_block] + self.output_blocks
+        for block in blocks:
+            for module in block:
+                if hasattr(module, "set_use_laser_sdpa"):
+                    module.set_use_laser_sdpa(pewpew)
+
     def set_gradient_checkpointing(self, value=False):
         blocks = self.input_blocks + [self.middle_block] + self.output_blocks
         for block in blocks:
@@ -1131,28 +1136,6 @@ class SdxlUNet2DConditionModel(nn.Module):
                 if hasattr(module, "gradient_checkpointing"):
                     # logger.info(f{module.__class__.__name__} {module.gradient_checkpointing} -> {value}")
                     module.gradient_checkpointing = value
-    # WOOOO LET'S GET RET CONNING 
-    #def getbyname(module, access_string):
-
-    """
-    def continuous_abolisher(self):
-        blocks = self.input_blocks + [self.middle_block] + self.output_blocks
-        for block in blocks:
-            for module in block.modules():
-                if hasattr(module, "we_take_bias_removal_seriously_here"):
-                    module.we_take_bias_removal_seriously_here()
-                    #i think this is the right calling structure?
-    def lambda_clampbda(self):
-        blocks = self.input_blocks + [self.middle_block] + self.output_blocks
-        for block in blocks:
-            for module in block.modules():
-                if hasattr(module, "learnedlambda1"):
-                    module.learnedlambda1.data = torch.clamp(module.learnedlambda1.data, min=1e-2, max=2.0)
-                    #migrating clamp action her ebecause of suspicions about forwards pass calculation time.
-    def cleanup(self):
-        self.continuous_abolisher()
-        self.lambda_clampbda()
-    """
 
     # endregion
 

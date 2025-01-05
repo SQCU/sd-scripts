@@ -299,8 +299,7 @@ class ResnetBlock2D(nn.Module):
     def __init__(
         self,
         in_channels,
-        out_channels,
-        #learned_lambda_level = 0
+        out_channels
     ):
         super().__init__()
         self.in_channels = in_channels
@@ -327,7 +326,6 @@ class ResnetBlock2D(nn.Module):
             self.skip_connection = nn.Identity()
 
         self.gradient_checkpointing = False
-        #if learned_lambda_level: optimizations kill this
         self.learnedlambda1 = nn.Parameter(torch.tensor(1.0))
 
     def forward_body(self, x, emb):
@@ -653,8 +651,7 @@ class FeedForward(nn.Module):
 
 class BasicTransformerBlock(nn.Module):
     def __init__(
-        self, dim: int, num_attention_heads: int, attention_head_dim: int, cross_attention_dim: int, upcast_attention: bool = False, 
-        #learned_lambda_level=0
+        self, dim: int, num_attention_heads: int, attention_head_dim: int, cross_attention_dim: int, upcast_attention: bool = False
     ):
         super().__init__()
 
@@ -697,33 +694,6 @@ class BasicTransformerBlock(nn.Module):
         # 3. Feed-forward
         self.norm3 = nn.LayerNorm(dim)
 
-    """ candidate for deletion
-    def beta_clampy(self, term_for_clampy, beta, mink=None, maxk=None):
-        return torch.clamp(term_for_clampy,min=mink, max=maxk)*beta + (1-beta)*term_for_clampy
-    def nonbeta_clampy(self, term_for_clampy, mink=None, maxk=None):
-        return torch.clamp(term_for_clampy,min=mink, max=maxk)
-    """
-    """
-    def we_take_bias_removal_seriously_here(self):
-        bounds = self.ab_bounds
-        if self.incremental_abolish:
-            for b in self.norm1.bias.data:
-                b = self.beta_clampy(b,self.incremental_abolish,**bounds)
-            for b in self.norm2.bias.data:
-                b = self.beta_clampy(b,self.incremental_abolish,**bounds)
-            for b in self.norm3.bias.data:
-                b = self.beta_clampy(b,self.incremental_abolish,**bounds)
-            self.incremental_abolish += 0.01
-            if self.incremental_abolish >= 1:
-                self.incremental_abolish = False
-        elif self.bias_abolisher:
-            for b in self.norm1.bias.data:
-                b = self.nonbeta_clampy(b,**bounds)
-            for b in self.norm2.bias.data:
-                b = self.nonbeta_clampy(b,**bounds)
-            for b in self.norm3.bias.data:
-                b = self.nonbeta_clampy(b,**bounds)
-    """
     def set_use_memory_efficient_attention(self, xformers: bool, mem_eff: bool):
         self.attn1.set_use_memory_efficient_attention(xformers, mem_eff)
         self.attn2.set_use_memory_efficient_attention(xformers, mem_eff)
@@ -737,11 +707,10 @@ class BasicTransformerBlock(nn.Module):
         self.attn2.set_use_laser_sdpa(pewpew)
 
     def forward_body(self, hidden_states, context=None, timestep=None):       
-        #if hasattr(self, "learnedlambda3") and hasattr(self, "learnedlambda1"):
         # 1. Self-Attention
         norm_hidden_states = self.norm1(hidden_states)
 
-        hidden_states = self.attn1(norm_hidden_states) + hidden_states # self.learnedlambda3*
+        hidden_states = self.attn1(norm_hidden_states) + hidden_states 
 
         # 2. Cross-Attention
         norm_hidden_states = self.norm2(hidden_states)
@@ -752,34 +721,7 @@ class BasicTransformerBlock(nn.Module):
         hidden_states = self.ff(self.norm3(hidden_states)) + self.learnedlambda1*hidden_states
 
         return hidden_states
-        """
-        if not hasattr(self, "learnedlambda3") and hasattr(self, "learnedlambda1"):
-            # 1. Self-Attention
-            norm_hidden_states = self.norm1(hidden_states) 
-            hidden_states = self.attn1(norm_hidden_states) + hidden_states
 
-            # 2. Cross-Attention
-            norm_hidden_states = self.norm2(hidden_states)  
-            hidden_states = self.attn2(norm_hidden_states, context=context) + hidden_states
-
-            # 3. Feed-forward
-            #hidden_states = self.ff(self.norm3(hidden_states)) + hidden_states
-            hidden_states = self.ff(self.norm3(hidden_states)) + self.learnedlambda1*hidden_states
-
-            return hidden_states
-        else:
-            # 1. Self-Attention
-            norm_hidden_states = self.norm1(hidden_states) 
-            hidden_states = self.attn1(norm_hidden_states) + hidden_states
-
-            # 2. Cross-Attention
-            norm_hidden_states = self.norm2(hidden_states)  
-            hidden_states = self.attn2(norm_hidden_states, context=context) + hidden_states
-
-            # 3. Feed-forward
-            hidden_states = self.ff(self.norm3(hidden_states)) + hidden_states
-            return hidden_states
-        """
     def forward(self, hidden_states, context=None, timestep=None):
         if self.training and self.gradient_checkpointing:
             # logger.info("BasicTransformerBlock: checkpointing")
@@ -808,8 +750,7 @@ class Transformer2DModel(nn.Module):
         cross_attention_dim: Optional[int] = None,
         use_linear_projection: bool = False,
         upcast_attention: bool = False,
-        num_transformer_layers: int = 1,
-        #learned_lambda_level = 0
+        num_transformer_layers: int = 1
     ):
         super().__init__()
         self.in_channels = in_channels
@@ -836,7 +777,6 @@ class Transformer2DModel(nn.Module):
                     attention_head_dim,
                     cross_attention_dim=cross_attention_dim,
                     upcast_attention=upcast_attention,
-                    #learned_lambda_level = learned_lambda_level
                 )
             )
 
@@ -910,9 +850,12 @@ class Upsample2D(nn.Module):
         # Cast to float32 to as 'upsample_nearest2d_out_frame' op does not support bfloat16
         # TODO(Suraj): Remove this cast once the issue is fixed in PyTorch
         # https://github.com/pytorch/pytorch/issues/86679
+        # fixed in ptorch 2.1 https://github.com/pytorch/pytorch/issues/86679#issuecomment-1783978767
+        """
         dtype = hidden_states.dtype
         if dtype == torch.bfloat16:
             hidden_states = hidden_states.to(torch.float32)
+        """
 
         # upsample_nearest_nhwc fails with large batch sizes. see https://github.com/huggingface/diffusers/issues/984
         if hidden_states.shape[0] >= 64:
@@ -925,10 +868,12 @@ class Upsample2D(nn.Module):
             hidden_states = F.interpolate(hidden_states, size=output_size, mode="nearest")
 
         # If the input is bfloat16, we cast back to bfloat16
+        """ #upcast and downcast obsolete in ptorch 2.1
         if dtype == torch.bfloat16:
             hidden_states = hidden_states.to(dtype)
 
         hidden_states = self.conv(hidden_states)
+        """
 
         return hidden_states
 
@@ -969,10 +914,12 @@ class SdxlUNet2DConditionModel(nn.Module):
 
         self.gradient_checkpointing = False
         # self.sample_size = sample_size
+        """
         if "learned_lambda_level" in kwargs: 
             self.learned_lambda_level = kwargs.get("learned_lambda_level")
         else:
             self.learned_lambda_level = 0
+        """
 
         # time embedding
         self.time_embed = nn.Sequential(
@@ -1004,8 +951,7 @@ class SdxlUNet2DConditionModel(nn.Module):
             layers = [
                 ResnetBlock2D(
                     in_channels=1 * self.model_channels,
-                    out_channels=1 * self.model_channels,
-                    #learned_lambda_level = self.learned_lambda_level
+                    out_channels=1 * self.model_channels
                 ),
             ]
             self.input_blocks.append(nn.ModuleList(layers))
@@ -1024,8 +970,7 @@ class SdxlUNet2DConditionModel(nn.Module):
             layers = [
                 ResnetBlock2D(
                     in_channels=(1 if i == 0 else 2) * self.model_channels,
-                    out_channels=2 * self.model_channels,
-                    #learned_lambda_level = self.learned_lambda_level
+                    out_channels=2 * self.model_channels
                 ),
                 Transformer2DModel(
                     num_attention_heads=2 * self.model_channels // 64,
@@ -1033,8 +978,7 @@ class SdxlUNet2DConditionModel(nn.Module):
                     in_channels=2 * self.model_channels,
                     num_transformer_layers=2,
                     use_linear_projection=True,
-                    cross_attention_dim=2048,
-                    #learned_lambda_level = self.learned_lambda_level
+                    cross_attention_dim=2048
                 ),
             ]
             self.input_blocks.append(nn.ModuleList(layers))
@@ -1061,8 +1005,7 @@ class SdxlUNet2DConditionModel(nn.Module):
                     in_channels=4 * self.model_channels,
                     num_transformer_layers=10,
                     use_linear_projection=True,
-                    cross_attention_dim=2048,
-                    #learned_lambda_level = self.learned_lambda_level
+                    cross_attention_dim=2048
                 ),
             ]
             self.input_blocks.append(nn.ModuleList(layers))
@@ -1072,8 +1015,7 @@ class SdxlUNet2DConditionModel(nn.Module):
             [
                 ResnetBlock2D(
                     in_channels=4 * self.model_channels,
-                    out_channels=4 * self.model_channels,
-                    #learned_lambda_level = self.learned_lambda_level
+                    out_channels=4 * self.model_channels
                 ),
                 Transformer2DModel(
                     num_attention_heads=4 * self.model_channels // 64,
@@ -1081,13 +1023,11 @@ class SdxlUNet2DConditionModel(nn.Module):
                     in_channels=4 * self.model_channels,
                     num_transformer_layers=10,
                     use_linear_projection=True,
-                    cross_attention_dim=2048,
-                    #learned_lambda_level = self.learned_lambda_level
+                    cross_attention_dim=2048
                 ),
                 ResnetBlock2D(
                     in_channels=4 * self.model_channels,
-                    out_channels=4 * self.model_channels,
-                    #learned_lambda_level = self.learned_lambda_level
+                    out_channels=4 * self.model_channels
                 ),
             ]
         )
@@ -1100,8 +1040,7 @@ class SdxlUNet2DConditionModel(nn.Module):
             layers = [
                 ResnetBlock2D(
                     in_channels=4 * self.model_channels + (4 if i <= 1 else 2) * self.model_channels,
-                    out_channels=4 * self.model_channels,
-                    #learned_lambda_level = self.learned_lambda_level
+                    out_channels=4 * self.model_channels
                 ),
                 Transformer2DModel(
                     num_attention_heads=4 * self.model_channels // 64,
@@ -1109,8 +1048,7 @@ class SdxlUNet2DConditionModel(nn.Module):
                     in_channels=4 * self.model_channels,
                     num_transformer_layers=10,
                     use_linear_projection=True,
-                    cross_attention_dim=2048,
-                    #learned_lambda_level = self.learned_lambda_level
+                    cross_attention_dim=2048
                 ),
             ]
             if i == 2:
@@ -1128,8 +1066,7 @@ class SdxlUNet2DConditionModel(nn.Module):
             layers = [
                 ResnetBlock2D(
                     in_channels=2 * self.model_channels + (4 if i == 0 else (2 if i == 1 else 1)) * self.model_channels,
-                    out_channels=2 * self.model_channels,
-                    #learned_lambda_level = self.learned_lambda_level
+                    out_channels=2 * self.model_channels
                 ),
                 Transformer2DModel(
                     num_attention_heads=2 * self.model_channels // 64,
@@ -1137,8 +1074,7 @@ class SdxlUNet2DConditionModel(nn.Module):
                     in_channels=2 * self.model_channels,
                     num_transformer_layers=2,
                     use_linear_projection=True,
-                    cross_attention_dim=2048,
-                    #learned_lambda_level = self.learned_lambda_level
+                    cross_attention_dim=2048
                 ),
             ]
             if i == 2:
@@ -1156,8 +1092,7 @@ class SdxlUNet2DConditionModel(nn.Module):
             layers = [
                 ResnetBlock2D(
                     in_channels=1 * self.model_channels + (2 if i == 0 else 1) * self.model_channels,
-                    out_channels=1 * self.model_channels,
-                    #learned_lambda_level = self.learned_lambda_level
+                    out_channels=1 * self.model_channels
                 ),
             ]
 
@@ -1225,28 +1160,6 @@ class SdxlUNet2DConditionModel(nn.Module):
                 if hasattr(module, "gradient_checkpointing"):
                     # logger.info(f{module.__class__.__name__} {module.gradient_checkpointing} -> {value}")
                     module.gradient_checkpointing = value
-    # WOOOO LET'S GET RET CONNING 
-    #def getbyname(module, access_string):
-
-    """
-    def continuous_abolisher(self):
-        blocks = self.input_blocks + [self.middle_block] + self.output_blocks
-        for block in blocks:
-            for module in block.modules():
-                if hasattr(module, "we_take_bias_removal_seriously_here"):
-                    module.we_take_bias_removal_seriously_here()
-                    #i think this is the right calling structure?
-    def lambda_clampbda(self):
-        blocks = self.input_blocks + [self.middle_block] + self.output_blocks
-        for block in blocks:
-            for module in block.modules():
-                if hasattr(module, "learnedlambda1"):
-                    module.learnedlambda1.data = torch.clamp(module.learnedlambda1.data, min=1e-2, max=2.0)
-                    #migrating clamp action her ebecause of suspicions about forwards pass calculation time.
-    def cleanup(self):
-        self.continuous_abolisher()
-        self.lambda_clampbda()
-    """
 
     # endregion
 

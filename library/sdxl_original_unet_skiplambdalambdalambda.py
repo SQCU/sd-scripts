@@ -577,30 +577,35 @@ class CrossAttention(nn.Module):
         k_in = self.to_k(context)
         v_in = self.to_v(context)
         
-        #laser
-        #valueoffset_biggymax = torch.max(v_in, keepdim=True)
-        valueoffset_biggymax = torch.max(v_in)
+        #laser offset
+        # was the previous operation not recording the maximum per 'column' of the 'value' matrix?
+        # why do i persist in using python -> interactive repl instead of python -> testing instrumentation?
+        valueoffset_biggymax, indices = torch.max(v_in, axis=1, keepdim=True)
+        del indices #TORCH WHY ARE YOU BEING LIKE THIS
         #valueoffset_biggymax.requires_grad_(False) #sure hope this works like in the jax model
         #haha nope it didn't
         #valueoffset_biggymax.no_grad()
         valueoffset_biggymax = valueoffset_biggymax.detach() #this one might be more wasteful in memory?
-        v_exp_in = torch.exp(v_in - valueoffset_biggymax)   #scale, shift
+        v_in = torch.exp(v_in - valueoffset_biggymax)   #scale, shift
 
-        q, k, v = map(lambda t: rearrange(t, "b n (h d) -> b h n d", h=h), (q_in, k_in, v_exp_in))
-        del q_in, k_in, v_in, v_exp_in
-
+        #scary einops transpose
+        q, k, v = map(lambda t: rearrange(t, "b n (h d) -> b h n d", h=h), (q_in, k_in, v_in))
+        del q_in, k_in, v_in
+        
         #stock impl
         out = F.scaled_dot_product_attention(q, k, v, attn_mask=mask, dropout_p=0.0, is_causal=False)
+        
+        #scary einops reverse transpose
         out = rearrange(out, "b h n d -> b n (h d)", h=h)
 
         #laser descale, deshift
         out = torch.log(out) + valueoffset_biggymax
         del valueoffset_biggymax
 
-        #stock impl... feedforward?
+
+        #stock impl... linear projection?
         out = self.to_out[0](out)
         return out
-
 
 # feedforward
 class GEGLU(nn.Module):
@@ -620,7 +625,9 @@ class GEGLU(nn.Module):
         if gate.device.type != "mps":
             return F.gelu(gate)
         # mps: gelu is not implemented for float16
-        return F.gelu(gate.to(dtype=torch.float32)).to(dtype=gate.dtype)
+        # docs don't entirely agree
+        #return F.gelu(gate.to(dtype=torch.float32)).to(dtype=gate.dtype)
+        return F.gelu(gate)
 
     def forward(self, hidden_states):
         hidden_states, gate = self.proj(hidden_states).chunk(2, dim=-1)
@@ -871,9 +878,9 @@ class Upsample2D(nn.Module):
         """ #upcast and downcast obsolete in ptorch 2.1
         if dtype == torch.bfloat16:
             hidden_states = hidden_states.to(dtype)
+        """
 
         hidden_states = self.conv(hidden_states)
-        """
 
         return hidden_states
 
@@ -1169,7 +1176,7 @@ class SdxlUNet2DConditionModel(nn.Module):
 
         hs = []
         t_emb = get_timestep_embedding(timesteps, self.model_channels, downscale_freq_shift=0)  # , repeat_only=False)
-        t_emb = t_emb.to(x.dtype)
+        t_emb = t_emb.to(x.dtype) #this is only here because of a torch.float32 cast en-function. suspicious.
         emb = self.time_embed(t_emb)
 
         assert x.shape[0] == y.shape[0], f"batch size mismatch: {x.shape[0]} != {y.shape[0]}"
@@ -1259,7 +1266,7 @@ class InferSdxlUNet2DConditionModel:
 
         hs = []
         t_emb = get_timestep_embedding(timesteps, _self.model_channels, downscale_freq_shift=0)  # , repeat_only=False)
-        t_emb = t_emb.to(x.dtype)
+        t_emb = t_emb.to(x.dtype) #this is only here because of a torch.float32 cast en-function. suspicious.
         emb = _self.time_embed(t_emb)
 
         assert x.shape[0] == y.shape[0], f"batch size mismatch: {x.shape[0]} != {y.shape[0]}"

@@ -194,11 +194,6 @@ def cleanup(unet:SdxlUNet2DConditionModel, affinenormbiases=[], learnedlambdas=[
             lambdas.data = torch.clamp(lambdas.data, min=1e-2, max=2.0)
             #migrating clamp action here because of suspicions about forwards pass calculation time.
 
-    """
-    def cleanup(self):
-        self.continuous_abolisher(unet, affinenormbiases=affinenormbiases)
-        self.lambda_clampbda(unet, learnedlambdas=learnedlambdas)
-    """
     continuous_abolisher(unet, affinenormbiases=affinenormbiases, incremental_abolish=incremental_abolish)
     lambda_clampbda(unet, learnedlambdas=learnedlambdas)
 
@@ -610,13 +605,28 @@ def train(args):
     # dataloaderを準備する
     # DataLoaderのプロセス数：0 は persistent_workers が使えないので注意
     n_workers = min(args.max_data_loader_n_workers, os.cpu_count())  # cpu_count or max_data_loader_n_workers
+    dataloaderkwargs = {
+        'dataset':train_dataset_group,
+        'batch_size':1,
+        'shuffle':True,
+        'collate_fn':collator,
+        'num_workers':n_workers,
+        'persistent_workers':args.persistent_data_loader_workers
+    }
+    #args moved to a kwargdict so it's easier to append entries conditionally
+    if args.pytorch_pinned_dataloader:
+        dataloaderkwargs['pin_memory']=True
+    """
     train_dataloader = torch.utils.data.DataLoader(
-        train_dataset_group,
+        dataset=train_dataset_group,
         batch_size=1,
         shuffle=True,
         collate_fn=collator,
         num_workers=n_workers,
         persistent_workers=args.persistent_data_loader_workers,
+    )"""
+    train_dataloader = torch.utils.data.DataLoader(
+        **dataloaderkwargs
     )
 
     # 学習ステップ数を計算する
@@ -788,12 +798,9 @@ def train(args):
                             if optimizer_hooked_count[i] == num_parameters_per_group[i]:
                                 optimizers[i].step()
                                 optimizers[i].zero_grad(set_to_none=True)
-                                #if args.bias_abolisher:
-                                """ emergency holdout for bullying accelerator into working how e want it
-                                for model in accelerator._models:
-                                    cleanup(model, affinenormbiases=affinenormbiases, learnedlambdas=skipweight_params)
-                                """
-                                cleanup(unet, affinenormbiases=affinenormbiases, learnedlambdas=skipweight_params) 
+                                if args.bias_abolisher:
+                                    for model in accelerator._models:
+                                        cleanup(model, affinenormbiases=affinenormbiases, learnedlambdas=skipweight_params, incremental_abolish=args.incremental_abolish)
                                 # i think this is where you slap the abolisher?
 
                         parameter.register_post_accumulate_grad_hook(optimizer_hook)
@@ -1039,13 +1046,10 @@ def train(args):
                     optimizer.step()
                     lr_scheduler.step()
                     optimizer.zero_grad(set_to_none=True)
-                    #if args.bias_abolisher:
-                    """ emergency holdout for bullying accelerator into working how e want it
-                    for model in accelerator._models:
-                        cleanup(model, affinenormbiases=affinenormbiases, learnedlambdas=skipweight_params)
-                    """
-                    cleanup(unet, affinenormbiases=affinenormbiases, learnedlambdas=skipweight_params) # i think this is where you slap the abolisher?
-                    
+                    if args.bias_abolisher:
+                        #cleanup(unet, affinenormbiases=affinenormbiases, learnedlambdas=skipweight_params, incremental_abolish=incremental_abolish) # i think this is where you slap the abolisher?
+                        for model in accelerator._models:
+                            cleanup(model, affinenormbiases=affinenormbiases, learnedlambdas=skipweight_params, incremental_abolish=args.incremental_abolish)
                 else:
                     # optimizer.step() and optimizer.zero_grad() are called in the optimizer hook
                     lr_scheduler.step()
@@ -1320,6 +1324,12 @@ def setup_parser() -> argparse.ArgumentParser:
         type=float,
         default=None,
         help="interpolation term between clamped and nonclamped layernorm biases. pick something between 0.01 and 0.9.",
+    )
+    parser.add_argument(
+        "--pytorch_pinned_dataloader",
+        action="store_true",
+        default=None,
+        help="cuda pinned memory dataloader.",
     )
     parser.add_argument(
         "--use_laser_sdpa",

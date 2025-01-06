@@ -637,6 +637,7 @@ def train(args):
     train_dataloader = torch.utils.data.DataLoader(
         **dataloaderkwargs
     )
+
     # 学習ステップ数を計算する
     if args.max_train_epochs is not None:
         args.max_train_steps = args.max_train_epochs * math.ceil(
@@ -817,12 +818,9 @@ def train(args):
                             if optimizer_hooked_count[i] == num_parameters_per_group[i]:
                                 optimizers[i].step()
                                 optimizers[i].zero_grad(set_to_none=True)
-                                #if args.bias_abolisher:
-                                """ emergency holdout for bullying accelerator into working how e want it
-                                for model in accelerator._models:
-                                    cleanup(model, affinenormbiases=affinenormbiases, learnedlambdas=skipweight_params)
-                                """
-                                cleanup(unet, affinenormbiases=affinenormbiases, learnedlambdas=skipweight_params) 
+                                if args.bias_abolisher:
+                                    for model in accelerator._models:
+                                        cleanup(model, affinenormbiases=affinenormbiases, learnedlambdas=skipweight_params, incremental_abolish=args.incremental_abolish) 
                                 # i think this is where you slap the abolisher?
 
                         parameter.register_post_accumulate_grad_hook(optimizer_hook)
@@ -1068,12 +1066,10 @@ def train(args):
                     optimizer.step()
                     lr_scheduler.step()
                     optimizer.zero_grad(set_to_none=True)
-                    #if args.bias_abolisher:
-                    """ emergency holdout for bullying accelerator into working how e want it
-                    for model in accelerator._models:
-                        cleanup(model, affinenormbiases=affinenormbiases, learnedlambdas=skipweight_params)
-                    """
-                    cleanup(unet, affinenormbiases=affinenormbiases, learnedlambdas=skipweight_params) # i think this is where you slap the abolisher?
+                    if args.bias_abolisher:
+                        for model in accelerator._models:
+                            cleanup(model, affinenormbiases=affinenormbiases, learnedlambdas=skipweight_params, incremental_abolish=args.incremental_abolish)
+                    #cleanup(unet, affinenormbiases=affinenormbiases, learnedlambdas=skipweight_params) # i think this is where you slap the abolisher?
                     
                 else:
                     # optimizer.step() and optimizer.zero_grad() are called in the optimizer hook

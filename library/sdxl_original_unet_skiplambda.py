@@ -418,6 +418,7 @@ class CrossAttention(nn.Module):
         self.use_memory_efficient_attention_xformers = False
         self.use_memory_efficient_attention_mem_eff = False
         self.use_sdpa = False
+        self.use_laser_sdpa = False
 
     def set_use_memory_efficient_attention(self, xformers, mem_eff):
         self.use_memory_efficient_attention_xformers = xformers
@@ -425,6 +426,9 @@ class CrossAttention(nn.Module):
 
     def set_use_sdpa(self, sdpa):
         self.use_sdpa = sdpa
+    
+    def set_use_laser_sdpa(self, pewpew: bool):
+        self.use_laser_sdpa = pewpew
 
     def reshape_heads_to_batch_dim(self, tensor):
         batch_size, seq_len, dim = tensor.shape
@@ -445,6 +449,8 @@ class CrossAttention(nn.Module):
             return self.forward_memory_efficient_xformers(hidden_states, context, mask)
         if self.use_memory_efficient_attention_mem_eff:
             return self.forward_memory_efficient_mem_eff(hidden_states, context, mask)
+        if self.use_laser_sdpa: #and self.use_sdpa:
+            return self.laser_preattn_sdpa(hidden_states, context, mask)
         if self.use_sdpa:
             return self.forward_sdpa(hidden_states, context, mask)
 
@@ -554,6 +560,44 @@ class CrossAttention(nn.Module):
         out = self.to_out[0](out)
         return out
 
+    def laser_preattn_sdpa(self, x, context=None, mask=None):
+        #stock impl
+        h = self.heads
+        q_in = self.to_q(x)
+        context = context if context is not None else x
+        context = context.to(x.dtype)
+        k_in = self.to_k(context)
+        v_in = self.to_v(context)
+        
+        #laser offset
+        # was the previous operation not recording the maximum per 'column' of the 'value' matrix?
+        # why do i persist in using python -> interactive repl instead of python -> testing instrumentation?
+        valueoffset_biggymax, indices = torch.max(v_in, axis=1, keepdim=True)
+        del indices #TORCH WHY ARE YOU BEING LIKE THIS
+        #valueoffset_biggymax.requires_grad_(False) #sure hope this works like in the jax model
+        #haha nope it didn't
+        #valueoffset_biggymax.no_grad()
+        valueoffset_biggymax = valueoffset_biggymax.detach() #this one might be more wasteful in memory?
+        v_in = torch.exp(v_in - valueoffset_biggymax)   #scale, shift
+
+        #scary einops transpose
+        q, k, v = map(lambda t: rearrange(t, "b n (h d) -> b h n d", h=h), (q_in, k_in, v_in))
+        del q_in, k_in, v_in
+        
+        #stock impl
+        out = F.scaled_dot_product_attention(q, k, v, attn_mask=mask, dropout_p=0.0, is_causal=False)
+        
+        #scary einops reverse transpose
+        out = rearrange(out, "b h n d -> b n (h d)", h=h)
+
+        #laser descale, deshift
+        out = torch.log(out) + valueoffset_biggymax
+        del valueoffset_biggymax
+
+
+        #stock impl... linear projection?
+        out = self.to_out[0](out)
+        return out
 
 # feedforward
 class GEGLU(nn.Module):
@@ -649,6 +693,10 @@ class BasicTransformerBlock(nn.Module):
         self.attn1.set_use_sdpa(sdpa)
         self.attn2.set_use_sdpa(sdpa)
 
+    def set_use_laser_sdpa(self, pewpew: bool):
+        self.attn1.set_use_laser_sdpa(pewpew)
+        self.attn2.set_use_laser_sdpa(pewpew)    
+
     def forward_body(self, hidden_states, context=None, timestep=None):
         # 1. Self-Attention
         norm_hidden_states = self.norm1(hidden_states)
@@ -739,6 +787,10 @@ class Transformer2DModel(nn.Module):
     def set_use_sdpa(self, sdpa):
         for transformer in self.transformer_blocks:
             transformer.set_use_sdpa(sdpa)
+
+    def set_use_laser_sdpa(self, pewpew):
+        for transformer in self.transformer_blocks:
+            transformer.set_use_laser_sdpa(pewpew)
 
     def forward(self, hidden_states, encoder_hidden_states=None, timestep=None):
         # 1. Input
@@ -1070,6 +1122,13 @@ class SdxlUNet2DConditionModel(nn.Module):
             for module in block:
                 if hasattr(module, "set_use_sdpa"):
                     module.set_use_sdpa(sdpa)
+
+    def set_use_laser_sdpa(self, pewpew: bool) -> None:
+        blocks = self.input_blocks + [self.middle_block] + self.output_blocks
+        for block in blocks:
+            for module in block:
+                if hasattr(module, "set_use_laser_sdpa"):
+                    module.set_use_laser_sdpa(pewpew)
 
     def set_gradient_checkpointing(self, value=False):
         blocks = self.input_blocks + [self.middle_block] + self.output_blocks

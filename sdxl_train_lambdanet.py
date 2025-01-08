@@ -352,6 +352,14 @@ def train(args):
         logger.info("Enable LAZER-SDPA for U-Net")
         unet.set_use_laser_sdpa(True)
 
+    if args.use_qknorm:
+        logger.info("Enable qk-norm for U-Net, you scoundrel ;')")
+        unet.set_use_qknorm(True)
+
+    if args.use_laser_qknorm:
+        logger.info("Enable laser-qk-norm for U-Net, you scoundrel ;')")
+        unet.set_use_laser_qknorm(True)
+
     # 学習を準備する
     if cache_latents:
         vae.to(accelerator.device, dtype=vae_dtype)
@@ -1215,6 +1223,18 @@ def setup_parser() -> argparse.ArgumentParser:
         action="store_true",
         default=None,
         help="rescale those numbers",
+    )
+    parser.add_argument(
+        "--use_qknorm",
+        action="store_true",
+        default=None,
+        help="rescale query, key to minimize saturation. also another learnable parameter :)",
+    )
+    parser.add_argument(
+        "--use_laser_qknorm",
+        action="store_true",
+        default=None,
+        help="rescale those numbers, then rescale query, key to minimize saturation. also another learnable parameter :)",
     )
     return parser
 

@@ -170,14 +170,18 @@ def _load_state_dict_on_device(model, state_dict, device, dtype=None):
     def torchparam_nameyoink(keyname):
         check = "learnedlambda"
         return check in keyname.lower()
+    def torchparam_qknyoink(keyname):
+        check = "qkn_gnought"
+        return check in keyname.lower()
 
     fixdict = {}
     # orig lambdalambdanet def:
     # self.learnedlambda1 = nn.Parameter(torch.tensor(0.5))
     for namecheck in missing_keys:
         if torchparam_nameyoink(namecheck):
-            fixdict[namecheck] = torch.nn.Parameter(torch.tensor(data=0.95, dtype=torch.bfloat16))
-    
+            fixdict[namecheck] = torch.nn.Parameter(torch.tensor(data=0.95)) #dtype=torch.bfloat16
+        if torchparam_qknyoink(namecheck):
+            fixdict[namecheck] = torch.nn.Parameter(torch.tensor(data=1.0)) #why is everything in pytorch always this broken
     if fixdict:
         logger.info(f"a fixdict?\n{len(fixdict)}")
         state_dict.update(fixdict)

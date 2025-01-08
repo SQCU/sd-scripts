@@ -71,6 +71,50 @@ def default(val, d):
 
 # https://arxiv.org/abs/2205.14135
 
+#QKLAYERNORM WOOOO LETS GET TO QING SOME KS! NORMALLY!
+#this is probably correct but slow and correct but slow is not good enough.
+
+def qk_layer_normed_attention(query, key, value, attn_mask=None, dropout_p=0.0,
+    is_causal=False, scale=None, enable_gqa=False):
+    #we are pytorching it haha
+    L, S = query.size(-2), key.size(-2)
+    scale_factor = 1.0 if scale is None else scale  #remember we already squashed these values
+    attn_bias = torch.zeros(L, S, dtype=query.dtype, device=query.device)
+    
+    if is_causal:   #sounds caus-tly to change haha heeehehee
+        assert attn_mask is None
+        temp_mask = torch.ones(L, S, dtype=torch.bool).tril(diagonal=0)
+        attn_bias.masked_fill_(temp_mask.logical_not(), float("-inf"))
+        attn_bias.to(query.dtype)
+
+    if attn_mask is not None:   #more boilerplate ty pytorch
+        if attn_mask.dtype == torch.bool:
+            attn_bias.masked_fill_(attn_mask.logical_not(), float("-inf"))
+        else:
+            attn_bias += attn_mask
+    
+    if enable_gqa:  #who can say what this does
+        key = key.repeat_interleave(query.size(-3)//key.size(-3), -3)
+        value = value.repeat_interleave(query.size(-3)//value.size(-3), -3)
+    """ this is what you would do if you were sdpa!
+    attn_weight = query @ key.transpose(-2, -1) * scale_factor #where scale_factor = 1 / math.sqrt(query.size(-1))
+    attn_weight += attn_bias
+    attn_weight = torch.softmax(attn_weight, dim=-1)
+    attn_weight = torch.dropout(attn_weight, dropout_p, train=True)
+    """
+    #this is the qknorm part!
+    query = F.normalize(query, p=2, dim=-1) #qhat
+    key = F.normalize(key, p=2, dim=-1) #keyhat
+
+    attn_weight = torch.matmul(query, key.transpose(-2, -1)) * scale #no self. on scale since we functional   #also not torch.bmm(query, key.transpose(1, 2)) * scale
+    attn_weight += attn_bias
+    attn_weight = torch.softmax(attn_weight, dim=-1)
+    attn_weight = torch.dropout(attn_weight, dropout_p, train=True)
+    #non-functional impl. reshapes here.
+    #non-functional impl. uses proj. layer here.
+
+    return torch.matmul(attn_weight, value) #look at him go it's the mat mul!
+
 
 class FlashAttentionFunction(torch.autograd.Function):
     @staticmethod
@@ -413,12 +457,19 @@ class CrossAttention(nn.Module):
 
         self.to_out = nn.ModuleList([])
         self.to_out.append(nn.Linear(inner_dim, query_dim))
+
         # no dropout here
 
         self.use_memory_efficient_attention_xformers = False
         self.use_memory_efficient_attention_mem_eff = False
         self.use_sdpa = False
         self.use_laser_sdpa = False
+        self.use_qknorm = False
+        self.use_laser_qknorm = False
+        #self.use_qklayernorm keep this one in the back pocket
+
+        self.qkn_gnought = nn.Parameter(torch.tensor(1.0))
+        #self.qkn_gnought.requires_grad_(False)  #maybe this will stop non-qknorm runs from frying! haha this is pytorch something bad will happen anyways.
 
     def set_use_memory_efficient_attention(self, xformers, mem_eff):
         self.use_memory_efficient_attention_xformers = xformers
@@ -429,6 +480,15 @@ class CrossAttention(nn.Module):
     
     def set_use_laser_sdpa(self, pewpew: bool):
         self.use_laser_sdpa = pewpew
+
+    def set_use_qknorm(self, qknorm: bool):
+        self.use_qknorm = qknorm
+        self.qkn_gnought = nn.Parameter(torch.tensor(1.0))
+        self.qkn_gnought.requires_grad_(True)
+
+    def set_use_laser_qknorm(self, qknorm: bool):
+        self.use_laser_qknorm = qknorm
+        self.qkn_gnought.requires_grad_(True)
 
     def reshape_heads_to_batch_dim(self, tensor):
         batch_size, seq_len, dim = tensor.shape
@@ -449,6 +509,8 @@ class CrossAttention(nn.Module):
             return self.forward_memory_efficient_xformers(hidden_states, context, mask)
         if self.use_memory_efficient_attention_mem_eff:
             return self.forward_memory_efficient_mem_eff(hidden_states, context, mask)
+        if self.use_laser_qknorm:
+            return self.laser_preattn_qknorm(hidden_states, context, mask)
         if self.use_laser_sdpa: #and self.use_sdpa:
             return self.laser_preattn_sdpa(hidden_states, context, mask)
         if self.use_sdpa:
@@ -463,7 +525,11 @@ class CrossAttention(nn.Module):
         key = self.reshape_heads_to_batch_dim(key)
         value = self.reshape_heads_to_batch_dim(value)
 
-        hidden_states = self._attention(query, key, value)
+        if self.use_qknorm: # look im just tryna edit all this code in place instead of refactoring control flow
+            hidden_states = qk_layer_normed_attention(query=query, key=key, value=value, attn_mask=mask, dropout_p=0.0, is_causal=False, scale=self.qkn_gnought)
+            hidden_states = self.reshape_batch_dim_to_heads(hidden_states)
+        else: #default case
+            hidden_states = self._attention(query, key, value)
 
         # linear proj
         hidden_states = self.to_out[0](hidden_states)
@@ -550,7 +616,7 @@ class CrossAttention(nn.Module):
         k_in = self.to_k(context)
         v_in = self.to_v(context)
 
-        q, k, v = map(lambda t: rearrange(t, "b n (h d) -> b h n d", h=h), (q_in, k_in, v_in))
+        q, k, v = map(lambda t: rearrange(t, "b n (h d) -> b h n d", h=h), (q_in, k_in, v_in))  
         del q_in, k_in, v_in
 
         out = F.scaled_dot_product_attention(q, k, v, attn_mask=mask, dropout_p=0.0, is_causal=False)
@@ -581,6 +647,7 @@ class CrossAttention(nn.Module):
         v_in = torch.exp(v_in - valueoffset_biggymax)   #scale, shift
 
         #scary einops transpose
+        #oh wait is this the head splitting operation? neat!
         q, k, v = map(lambda t: rearrange(t, "b n (h d) -> b h n d", h=h), (q_in, k_in, v_in))
         del q_in, k_in, v_in
         
@@ -594,6 +661,46 @@ class CrossAttention(nn.Module):
         out = torch.log(out) + valueoffset_biggymax
         del valueoffset_biggymax
 
+        #stock impl... linear projection?
+        out = self.to_out[0](out)
+        return out
+
+    def laser_preattn_qknorm(self, x, context=None, mask=None):
+        #stock impl
+        h = self.heads
+        q_in = self.to_q(x)
+        context = context if context is not None else x
+        context = context.to(x.dtype)
+        k_in = self.to_k(context)
+        v_in = self.to_v(context)
+        
+        valueoffset_biggymax, indices = torch.max(v_in, axis=1, keepdim=True)
+        del indices #TORCH WHY ARE YOU BEING LIKE THIS
+
+        valueoffset_biggymax = valueoffset_biggymax.detach() #this one might be more wasteful in memory?
+        v_in = torch.exp(v_in - valueoffset_biggymax)   #scale, shift
+
+        #scary einops transpose
+        #oh wait is this the head splitting operation? neat!
+        q, k, v = map(lambda t: rearrange(t, "b n (h d) -> b h n d", h=h), (q_in, k_in, v_in))
+        del q_in, k_in, v_in
+        
+        #this is the qknorm part!
+        q = F.normalize(q, p=2, dim=-1) #qhat
+        k = F.normalize(k, p=2, dim=-1) #keyhat
+
+        #stock impl
+        #out = qk_layer_normed_attention(query=q, key=k, value=v, attn_mask=mask, dropout_p=0.0, is_causal=False, scale=self.qkn_gnought)
+        #okay now lets try overriding F.sdpa:   
+        #google embedded llm suggests appending .item() to... yeah idk.
+        out = F.scaled_dot_product_attention(q, k, v, attn_mask=mask, dropout_p=0.0, is_causal=False, scale=self.qkn_gnought.item())
+
+        #scary einops reverse transpose
+        out = rearrange(out, "b h n d -> b n (h d)", h=h)
+
+        #laser descale, deshift
+        out = torch.log(out) + valueoffset_biggymax
+        del valueoffset_biggymax
 
         #stock impl... linear projection?
         out = self.to_out[0](out)
@@ -695,7 +802,16 @@ class BasicTransformerBlock(nn.Module):
 
     def set_use_laser_sdpa(self, pewpew: bool):
         self.attn1.set_use_laser_sdpa(pewpew)
-        self.attn2.set_use_laser_sdpa(pewpew)    
+        self.attn2.set_use_laser_sdpa(pewpew)
+
+    def set_use_qknorm(self, qknorm: bool):
+        self.attn1.set_use_qknorm(qknorm)
+        self.attn2.set_use_qknorm(qknorm)
+
+    def set_use_laser_qknorm(self, qknorm: bool):
+        self.attn1.set_use_laser_qknorm(qknorm)
+        self.attn2.set_use_laser_qknorm(qknorm)
+    
 
     def forward_body(self, hidden_states, context=None, timestep=None):
         # 1. Self-Attention
@@ -791,6 +907,14 @@ class Transformer2DModel(nn.Module):
     def set_use_laser_sdpa(self, pewpew):
         for transformer in self.transformer_blocks:
             transformer.set_use_laser_sdpa(pewpew)
+
+    def set_use_qknorm(self, qknorm: bool):
+        for transformer in self.transformer_blocks:
+            transformer.set_use_qknorm(qknorm)
+
+    def set_use_laser_qknorm(self, qknorm: bool):
+        for transformer in self.transformer_blocks:
+            transformer.set_use_laser_qknorm(qknorm)   
 
     def forward(self, hidden_states, encoder_hidden_states=None, timestep=None):
         # 1. Input
@@ -1130,6 +1254,20 @@ class SdxlUNet2DConditionModel(nn.Module):
                 if hasattr(module, "set_use_laser_sdpa"):
                     module.set_use_laser_sdpa(pewpew)
 
+    def set_use_qknorm(self, qknorm: bool) -> None:
+        blocks = self.input_blocks + [self.middle_block] + self.output_blocks
+        for block in blocks:
+            for module in block:
+                if hasattr(module, "set_use_qknorm"):
+                     module.set_use_qknorm(qknorm)
+
+    def set_use_laser_qknorm(self, qknorm: bool) -> None:
+        blocks = self.input_blocks + [self.middle_block] + self.output_blocks
+        for block in blocks:
+            for module in block:
+                if hasattr(module, "set_use_laser_qknorm"):
+                     module.set_use_laser_qknorm(qknorm)
+
     def set_gradient_checkpointing(self, value=False):
         blocks = self.input_blocks + [self.middle_block] + self.output_blocks
         for block in blocks:
@@ -1137,6 +1275,7 @@ class SdxlUNet2DConditionModel(nn.Module):
                 if hasattr(module, "gradient_checkpointing"):
                     # logger.info(f{module.__class__.__name__} {module.gradient_checkpointing} -> {value}")
                     module.gradient_checkpointing = value
+                    
 
     # endregion
 

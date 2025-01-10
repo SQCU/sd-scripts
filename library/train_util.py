@@ -5404,12 +5404,14 @@ def get_noise_noisy_latents_and_timesteps(args, noise_scheduler, latents):
 
 
 # NOTE: if you're using the scheduled version, huber_c has to depend on the timesteps already
+#above note deprecated.
 def conditional_loss(
-    model_pred: torch.Tensor, target: torch.Tensor, reduction: str = "mean", loss_type: str = "l2", huber_c: float = 0.1
+    model_pred: torch.Tensor, target: torch.Tensor, reduction: str = "none", loss_type: str = "l2", huber_c: float = 1.0
 ):
 
     if loss_type == "l2":
-        loss = torch.nn.functional.mse_loss(model_pred, target, reduction=reduction)
+        loss = torch.nn.functional.mse_loss(model_pred, target, reduction=reduction, delta=huber_c)
+    r""" what a disaster.
     elif loss_type == "huber":
         loss = 2 * huber_c * (torch.sqrt((model_pred - target) ** 2 + huber_c**2) - huber_c)
         if reduction == "mean":
@@ -5422,6 +5424,13 @@ def conditional_loss(
             loss = torch.mean(loss)
         elif reduction == "sum":
             loss = torch.sum(loss)
+    """
+    elif loss_type == "huber":
+        #note: only ever use with reduction='none' and a separate loss.mean([1,2,3]) 'to average over non-batch dimension' subsequent.
+        #if you check pytorch docs youll find mseloss used to only mean over minibatches and is now being deprecated towards similar behavior.
+        loss = torch.nn.functional.huber_loss(model_pred, target, reduction=reduction)
+    elif: loss_type == "smooth_l1":
+        loss = torch.nn.functional.smooth_l1_loss(model_pred, target, reduction=reduction, beta=huber_c)
     else:
         raise NotImplementedError(f"Unsupported Loss Type {loss_type}")
     return loss

@@ -5360,7 +5360,7 @@ def get_timesteps_and_huber_c(args, min_timestep, max_timestep, noise_scheduler,
     timestep_domain = noise_scheduler.config.num_train_timesteps
 
     def hubsched_exp(timestep):
-        alpha = -torch.log(args.huber_c) / get_timesteps_and_huber_c.timestep_domain
+        alpha = torch.tensor(-math.log(args.huber_c) / timestep_domain)
         return torch.exp(-alpha * timestep.item())
 
     def hubsched_snr(timestep):

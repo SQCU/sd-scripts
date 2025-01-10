@@ -5380,7 +5380,6 @@ def get_timesteps_and_huber_c(args, min_timestep, max_timestep, noise_scheduler,
     else: #args.huber_schedule == "constant":
         huber_coefficient = hubsched_cnst(timesteps)
         #now lets make it *really* constant so the batch splitting case in conditional_loss doesn't happen!
-        huber_coefficient = huber_coefficient[0]
 
     timesteps = timesteps.long()
     return timesteps, huber_coefficient #huber C is a tensor now haha have fun!

@@ -3664,10 +3664,15 @@ def add_training_arguments(parser: argparse.ArgumentParser, support_dreambooth: 
     parser.add_argument(
         "--huber_c",
         type=float,
-        default=0.1,
+        default=1.0,
         help="The huber loss parameter. Only used if one of the huber loss modes (huber or smooth l1) is selected with loss_type. default is 0.1 / Huber損失のパラメータ。loss_typeがhuberまたはsmooth l1の場合に有効。デフォルトは0.1",
     )
-
+    parser.add_argument(
+        "--khrapov_et_al_scheduled_huber_coefficient",
+        action="store_true",
+        default=False,
+        help="*whether* to use khrapov et al unprincipled untested huber_c scheduling as a snr-scaled loss weighting. see commentary on xitter.",
+    )
     parser.add_argument(
         "--lowram",
         action="store_true",
@@ -5341,31 +5346,76 @@ def get_timesteps_and_huber_c(args, min_timestep, max_timestep, noise_scheduler,
     # TODO: if a huber loss is selected, it will use constant timesteps for each batch
     # as. In the future there may be a smarter way
 
-    if args.loss_type == "huber" or args.loss_type == "smooth_l1":
-        timesteps = torch.randint(min_timestep, max_timestep, (1,), device="cpu")
-        timestep = timesteps.item()
 
-        if args.huber_schedule == "exponential":
-            alpha = -math.log(args.huber_c) / noise_scheduler.config.num_train_timesteps
-            huber_c = math.exp(-alpha * timestep)
-        elif args.huber_schedule == "snr":
-            alphas_cumprod = noise_scheduler.alphas_cumprod[timestep]
-            sigmas = ((1.0 - alphas_cumprod) / alphas_cumprod) ** 0.5
-            huber_c = (1 - args.huber_c) / (1 + sigmas) ** 2 + args.huber_c
-        elif args.huber_schedule == "constant":
-            huber_c = args.huber_c
-        else:
-            raise NotImplementedError(f"Unknown Huber loss schedule {args.huber_schedule}!")
+        # a quick review of how to apply a function elementwise along a torch tensor:
+        #def flimmy(tenny, alpha):
+        #   return  torch.exp(-alpha * tenny)
+        #...
+        #tensor_reference_symbol.apply_(flimmy)
+        #however apply_ is forbidden for cuda operations, 
+        #so for situations like these, we may want to create a torch.ones_like(tenny) or torch.zeros_like(tenny).
 
-        timesteps = timesteps.repeat(b_size).to(device)
-    elif args.loss_type == "l2":
-        timesteps = torch.randint(min_timestep, max_timestep, (b_size,), device=device)
-        huber_c = 1  # may be anything, as it's not used
-    else:
-        raise NotImplementedError(f"Unknown loss type {args.loss_type}")
+    timesteps = torch.randint(min_timestep, max_timestep, (b_size,), device=device) #stock implementation!
+    huber_coefficient = torch.ones_like(timesteps)
+    timestep_domain = noise_scheduler.config.num_train_timesteps
+
+    def hubsched_exp(timestep):
+        alpha = -torch.log(args.huber_c) / get_timesteps_and_huber_c.timestep_domain
+        return torch.exp(-alpha * timestep.item())
+
+    def hubsched_snr(timestep):
+        alphas_cprd = noise_scheduler.alphas_cumprod[timestep.item()]
+        sigmas = ((1-alphas_cprd)/alphas_cprd) ** 0.5
+        return (1-args.huber_c) / (1+sigmas) **2 + args.huber_c
+
+    def hubsched_cnst(timestep):
+        return args.huber_c
+
+    if args.huber_schedule == "exponential":
+        for t in timesteps:
+            huber_coefficient = hubsched_exp(t)
+    elif args.huber_schedule == "snr":
+        for t in timesteps:
+            huber_coefficient = hubsched_snr(t)
+    else: #args.huber_schedule == "constant":
+        huber_coefficient = hubsched_cnst(timesteps)
+        #now lets make it *really* constant so the batch splitting case in conditional_loss doesn't happen!
+        huber_coefficient = huber_coefficient[0]
+
     timesteps = timesteps.long()
+    return timesteps, huber_coefficient #huber C is a tensor now haha have fun!
 
-    return timesteps, huber_c
+    #   actually we don't even need this block. why wouldn't constant be the default case? unbelievable.
+    #else
+    #    if args.loss_type == "huber" or args.loss_type == "smooth_l1":
+    #        logger.info(f"how did you even trigger this codepath?")
+    #        raise NotImplementedError(f"Unknown Huber loss schedule {args.huber_schedule}!")
+
+    #if args.loss_type == "huber" or args.loss_type == "smooth_l1":
+        #nice try buddy
+        #timesteps = torch.randint(min_timestep, max_timestep, (1,), device="cpu")
+        #timestep = timesteps.item()
+
+        #if args.huber_schedule == "exponential":
+        #    alpha = -math.log(args.huber_c) / noise_scheduler.config.num_train_timesteps
+        #    huber_c = math.exp(-alpha * timestep)
+        #elif args.huber_schedule == "snr":
+        #    alphas_cumprod = noise_scheduler.alphas_cumprod[timestep]
+        #    sigmas = ((1.0 - alphas_cumprod) / alphas_cumprod) ** 0.5
+        #    huber_c = (1 - args.huber_c) / (1 + sigmas) ** 2 + args.huber_c
+        #elif args.huber_schedule == "constant":
+        #    huber_c = args.huber_c
+        #else:
+        #    raise NotImplementedError(f"Unknown Huber loss schedule {args.huber_schedule}!")
+        
+        #nice try buddy
+        #timesteps = timesteps.repeat(b_size).to(device)
+    #elif args.loss_type == "l2":
+        #timesteps = torch.randint(min_timestep, max_timestep, (b_size,), device=device)
+        #huber_c = 1  # may be anything, as it's not used
+    #else:
+    #    raise NotImplementedError(f"Unknown loss type {args.loss_type}")
+
 
 
 def get_noise_noisy_latents_and_timesteps(args, noise_scheduler, latents):
@@ -5387,7 +5437,11 @@ def get_noise_noisy_latents_and_timesteps(args, noise_scheduler, latents):
     min_timestep = 0 if args.min_timestep is None else args.min_timestep
     max_timestep = noise_scheduler.config.num_train_timesteps if args.max_timestep is None else args.max_timestep
 
-    timesteps, huber_c = get_timesteps_and_huber_c(args, min_timestep, max_timestep, noise_scheduler, b_size, latents.device)
+    if args.khrapov_et_al_scheduled_huber_coefficient:
+        timesteps, huber_c = get_timesteps_and_huber_c(args, min_timestep, max_timestep, noise_scheduler, b_size, latents.device)
+    else:
+        args.huber_schedule = "constant"
+        timesteps, huber_c = get_timesteps_and_huber_c(args, min_timestep, max_timestep, noise_scheduler, b_size, latents.device)
 
     # Add noise to the latents according to the noise magnitude at each timestep
     # (this is the forward diffusion process)
@@ -5406,31 +5460,49 @@ def get_noise_noisy_latents_and_timesteps(args, noise_scheduler, latents):
 # NOTE: if you're using the scheduled version, huber_c has to depend on the timesteps already
 #above note deprecated.
 def conditional_loss(
-    model_pred: torch.Tensor, target: torch.Tensor, reduction: str = "none", loss_type: str = "l2", huber_c: float = 1.0
+    model_pred: torch.Tensor, target: torch.Tensor, reduction: str = "none", loss_type: str = "l2", huber_c= torch.tensor(1.0)
 ):
 
     if loss_type == "l2":
-        loss = torch.nn.functional.mse_loss(model_pred, target, reduction=reduction, delta=huber_c)
-    r""" what a disaster.
-    elif loss_type == "huber":
-        loss = 2 * huber_c * (torch.sqrt((model_pred - target) ** 2 + huber_c**2) - huber_c)
-        if reduction == "mean":
-            loss = torch.mean(loss)
-        elif reduction == "sum":
-            loss = torch.sum(loss)
-    elif loss_type == "smooth_l1":
-        loss = 2 * (torch.sqrt((model_pred - target) ** 2 + huber_c**2) - huber_c)
-        if reduction == "mean":
-            loss = torch.mean(loss)
-        elif reduction == "sum":
-            loss = torch.sum(loss)
-    """
+        loss = torch.nn.functional.mse_loss(model_pred, target, reduction=reduction)
     elif loss_type == "huber":
         #note: only ever use with reduction='none' and a separate loss.mean([1,2,3]) 'to average over non-batch dimension' subsequent.
         #if you check pytorch docs youll find mseloss used to only mean over minibatches and is now being deprecated towards similar behavior.
-        loss = torch.nn.functional.huber_loss(model_pred, target, reduction=reduction)
-    elif: loss_type == "smooth_l1":
-        loss = torch.nn.functional.smooth_l1_loss(model_pred, target, reduction=reduction, beta=huber_c)
+
+        if huber_c.numel() == 1:
+            loss = torch.nn.functional.huber_loss(model_pred, target, reduction=reduction, delta=huber_c.item())
+        #if huber_c.size(0)>1:
+        else:
+            #split along batch dimension:
+            idx=0
+            loss = torch.zeroes_like(model_pred)    #container for da loss
+
+            for batch in loss:  #iterate long the batch dimension, using batchwise huber_c 
+                batchloss = torch.nn.functional.huber_loss(model_pred[idx], target[idx], reduction=reduction, delta=huber_c[idx])
+                loss[idx] = batchloss
+                idx += 1 #i haven't eaten dinner yet so i dont remember how iterators work :)
+        #else:
+        #    
+
+    elif loss_type == "smooth_l1":
+        #same caveat about reduction='none'. 
+        #please allow your users to apply loss weightings and other transforms along the batch dimension!
+
+        if huber_c.numel() == 1:
+            loss = torch.nn.functional.smooth_l1_loss(model_pred, target, reduction=reduction, beta=huber_c.item())
+        #if huber_c.size(0)>1:
+        else:
+            #split along batch dimension:
+            idx=0
+            loss = torch.zeroes_like(model_pred)    #container for da loss
+
+            for batch in loss:  #iterate long the batch dimension, using batchwise huber_c 
+                batchloss = torch.nn.functional.smooth_l1_loss(model_pred[idx], target[idx], reduction=reduction, beta=huber_c[idx])
+                loss[idx] = batchloss
+                idx += 1 #i haven't eaten dinner yet so i dont remember how iterators work :)
+        #else:
+        #    loss = torch.nn.functional.smooth_l1_loss(model_pred, target, reduction=reduction, beta=huber_c.item())
+
     else:
         raise NotImplementedError(f"Unsupported Loss Type {loss_type}")
     return loss

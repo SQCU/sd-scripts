@@ -5378,7 +5378,7 @@ def get_timesteps_and_huber_c(args, min_timestep, max_timestep, noise_scheduler,
         for t in timesteps:
             huber_coefficient = hubsched_snr(t)
     else: #args.huber_schedule == "constant":
-        huber_coefficient = hubsched_cnst(timesteps)
+        huber_coefficient = torch.tensor(hubsched_cnst(timesteps))
         #now lets make it *really* constant so the batch splitting case in conditional_loss doesn't happen!
 
     timesteps = timesteps.long()

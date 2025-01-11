@@ -108,7 +108,7 @@ def qk_layer_normed_attention(query, key, value, attn_mask=None, dropout_p=0.0,
 
     attn_weight = torch.matmul(query, key.transpose(-2, -1)) * scale #no self. on scale since we functional   #also not torch.bmm(query, key.transpose(1, 2)) * scale
     attn_weight += attn_bias
-    attn_weight = torch.softmax(attn_weight, dim=-1)
+    attn_weight = torch.softmax(attn_weight, dim=-1)   #wait isn't this superfluous if we're already multiplying f(x) = x / ||x||_2 , f(Q)*f(K)? isn't this the cos attn identity?
     attn_weight = torch.dropout(attn_weight, dropout_p, train=True)
     #non-functional impl. reshapes here.
     #non-functional impl. uses proj. layer here.
@@ -466,9 +466,9 @@ class CrossAttention(nn.Module):
         self.use_laser_sdpa = False
         self.use_qknorm = False
         self.use_laser_qknorm = False
-        #self.use_qklayernorm keep this one in the back pocket
+        self.use_qklayernorm = False #keep this one in the back pocket
 
-        self.qkn_gnought = nn.Parameter(torch.tensor(1.0))
+        self.qkn_gnought = nn.Parameter(torch.tensor(8.0))
         #self.qkn_gnought.requires_grad_(False)  #maybe this will stop non-qknorm runs from frying! haha this is pytorch something bad will happen anyways.
 
     def set_use_memory_efficient_attention(self, xformers, mem_eff):
@@ -483,7 +483,7 @@ class CrossAttention(nn.Module):
 
     def set_use_qknorm(self, qknorm: bool):
         self.use_qknorm = qknorm
-        self.qkn_gnought = nn.Parameter(torch.tensor(1.0))
+        #self.qkn_gnought = nn.Parameter(torch.tensor(1.0))
         self.qkn_gnought.requires_grad_(True)
 
     def set_use_laser_qknorm(self, qknorm: bool):
@@ -526,7 +526,8 @@ class CrossAttention(nn.Module):
         value = self.reshape_heads_to_batch_dim(value)
 
         if self.use_qknorm: # look im just tryna edit all this code in place instead of refactoring control flow
-            hidden_states = qk_layer_normed_attention(query=query, key=key, value=value, attn_mask=mask, dropout_p=0.0, is_causal=False, scale=self.qkn_gnought)
+            #hidden_states = qk_layer_normed_attention(query=query, key=key, value=value, attn_mask=mask, dropout_p=0.0, is_causal=False, scale=self.qkn_gnought)
+            hidden_states = qk_layer_normed_attention(query=query, key=key, value=value, attn_mask=mask, dropout_p=0.0, is_causal=False, scale=self.qkn_gnought.item())
             hidden_states = self.reshape_batch_dim_to_heads(hidden_states)
         else: #default case
             hidden_states = self._attention(query, key, value)
@@ -685,15 +686,15 @@ class CrossAttention(nn.Module):
         q, k, v = map(lambda t: rearrange(t, "b n (h d) -> b h n d", h=h), (q_in, k_in, v_in))
         del q_in, k_in, v_in
         
-        #this is the qknorm part!
+        #this is the qknorm part! (following qknorm author source)
         q = F.normalize(q, p=2, dim=-1) #qhat
         k = F.normalize(k, p=2, dim=-1) #keyhat
 
+
         #stock impl
-        #out = qk_layer_normed_attention(query=q, key=k, value=v, attn_mask=mask, dropout_p=0.0, is_causal=False, scale=self.qkn_gnought)
+        out = qk_layer_normed_attention(query=q, key=k, value=v, attn_mask=mask, dropout_p=0.0, is_causal=False, scale=self.qkn_gnought)
         #okay now lets try overriding F.sdpa:   
-        #google embedded llm suggests appending .item() to... yeah idk.
-        out = F.scaled_dot_product_attention(q, k, v, attn_mask=mask, dropout_p=0.0, is_causal=False, scale=self.qkn_gnought.item())
+        #out = F.scaled_dot_product_attention(q, k, v, attn_mask=mask, dropout_p=0.0, is_causal=False, scale=self.qkn_gnought.item())
 
         #scary einops reverse transpose
         out = rearrange(out, "b h n d -> b n (h d)", h=h)

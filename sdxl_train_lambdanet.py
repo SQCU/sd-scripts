@@ -916,15 +916,20 @@ def train(args):
                     or args.karras_edm_loss
                     or args.salimans_vpred_weighting
                     or args.sigmoid_k_weighting
+                    or args.khrapov_et_al_scheduled_huber_coefficient   #this means that huber coefficient can be different within batches. invalidates batch mean reduction.
                 ):
                     # do not mean over batch dimension for snr weight or scale v-pred loss
                     # why was this block hidden here?
                     loss = train_util.conditional_loss(
-                        noise_pred.float(), target.float(), reduction="none", loss_type=args.loss_type, huber_c=huber_c
+                        noise_pred.float(), target.float(), reduction="none", loss_type=args.loss_type, huber_c=huber_c, cumtoggle = True, args=args
                     )
                     if args.masked_loss or ("alpha_masks" in batch and batch["alpha_masks"] is not None):
                         loss = apply_masked_loss(loss, batch)
                     loss = loss.mean([1, 2, 3]) #mean over non-batch dimensions
+                    #but wait, does that even matter if the loss weighting is samplewise, 
+                    #e.g. bc the timestep parameter only varies along batch dimension?
+                    #this should already work fine with huber and smoothed loss. not sure why this wasn't in place forever ago.
+
 
                     if args.nullify_implicit_v_lossweight:  #unlike other loss weights this is a mix and match. go wild!
                         loss = nullify_implicit_v_lossweight(loss, timesteps, noise_scheduler, v_prediction=args.v_parameterization)

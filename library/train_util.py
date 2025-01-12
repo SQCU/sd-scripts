@@ -3674,6 +3674,19 @@ def add_training_arguments(parser: argparse.ArgumentParser, support_dreambooth: 
         help="*whether* to use khrapov et al unprincipled untested huber_c scheduling as a snr-scaled loss weighting. see commentary on xitter.",
     )
     parser.add_argument(
+        "--cumloss",
+        nargs='+',
+        default=False,
+        help="list of losses to accumulate over all model predictions. think long and hard before using this one.",
+    )
+    parser.add_argument(
+        "--cumloss_scalars",
+        type=float,
+        nargs='+',
+        default=False,
+        help="list of scalars complementing cumloss. think long and hard before using this one.",
+    )
+    parser.add_argument(
         "--lowram",
         action="store_true",
         help="enable low RAM optimization. e.g. load models to VRAM instead of RAM (for machines which have bigger VRAM than RAM such as Colab and Kaggle) / メインメモリが少ない環境向け最適化を有効にする。たとえばVRAMにモデルを読み込む等（ColabやKaggleなどRAMに比べてVRAMが多い環境向け）",
@@ -5358,37 +5371,39 @@ def get_timesteps_and_huber_c(args, min_timestep, max_timestep, noise_scheduler,
     timesteps = torch.randint(min_timestep, max_timestep, (b_size,), device=device) #stock implementation!
     huber_coefficient = torch.ones_like(timesteps)
     timestep_domain = noise_scheduler.config.num_train_timesteps
+    huber_epsilon = 1e-1
 
     def hubsched_exp(timestep):
-        alpha = torch.tensor(-math.log(args.huber_c) / timestep_domain)
+        alpha = torch.tensor(-math.log(args.huber_c) / timestep_domain).detach()
         return torch.exp(-alpha * timestep.item())
 
     def hubsched_snr(timestep):
-        alphas_cprd = noise_scheduler.alphas_cumprod[timestep.item()]
+        alphas_cprd = noise_scheduler.alphas_cumprod[timestep.item()].detach()
         sigmas = ((1-alphas_cprd)/alphas_cprd) ** 0.5
         return (1-args.huber_c) / (1+sigmas) **2 + args.huber_c
 
     def hubsched_vsigsnr(timestep):
-        alphas_cprd = noise_scheduler.alphas_cumprod[timestep.item()]
+        alphas_cprd = noise_scheduler.alphas_cumprod[timestep].detach()
         alpha = alphas_cprd**0.5
         sigma = (1-alphas_cprd)**0.5
-        twise_snr = torch.tensor((alpha/sigma)**2)
-        logsnr = torch.sigmoid(torch.log(-twise_snr+1))    #the +1 is for v. don't think about it.
-        return logsnr*args.huber_c
+        twise_snr = (alpha/sigma)**2
+        logsnr = torch.sigmoid(-torch.log(twise_snr)+1)+huber_epsilon  #kept getting 'huber delta must be positive', suggesting huber_c was being compressed to 0?  
+        return logsnr*args.huber_c 
 
     def hubsched_cnst(timestep):
         return args.huber_c
 
     if args.huber_schedule == "exponential":
-        for t in timesteps:
-            huber_coefficient = hubsched_exp(t)
+        for idx, t in enumerate(timesteps):
+            huber_coefficient[idx] = hubsched_exp(t)
     elif args.huber_schedule == "snr":
-        for t in timesteps:
-            huber_coefficient = hubsched_snr(t)
+        for idx, t in enumerate(timesteps):
+            huber_coefficient[idx] = hubsched_snr(t)
     elif args.huber_schedule == "vsignsnr":
-        huber_coefficient = torch.stack([hubsched_vsigsnr(t) for t in timesteps])
+        for idx, t in enumerate(timesteps):
+            huber_coefficient[idx] = hubsched_vsigsnr(t)
     else: #args.huber_schedule == "constant":
-        huber_coefficient = torch.tensor(hubsched_cnst(timesteps))
+        huber_coefficient = torch.tensor(hubsched_cnst(timesteps)).detach()
         #now lets make it *really* constant so the batch splitting case in conditional_loss doesn't happen!
 
     timesteps = timesteps.long()
@@ -5469,8 +5484,25 @@ def get_noise_noisy_latents_and_timesteps(args, noise_scheduler, latents):
 # NOTE: if you're using the scheduled version, huber_c has to depend on the timesteps already
 #above note deprecated.
 def conditional_loss(
-    model_pred: torch.Tensor, target: torch.Tensor, reduction: str = "none", loss_type: str = "l2", huber_c= torch.tensor(1.0)
+    model_pred: torch.Tensor, target: torch.Tensor, reduction: str = "none", loss_type: str = "l2", huber_c= torch.tensor(1.0), cumtoggle = False, args = None
 ):
+    if cumtoggle:
+        if args.cumloss:
+            #print(args.cumloss)
+            #print(args.cumloss_scalars)    #wow of course it's a dtype problem how could it be any other way.
+            loss = torch.zeros_like(model_pred)
+            for idx, string in enumerate(args.cumloss):
+                if string == "l2":
+                    loss = loss + args.cumloss_scalars[idx] * conditional_loss(model_pred[idx], target[idx], reduction, loss_type="l2", cumtoggle=False) 
+                    #suspect its more operations optimal to stuff a tensor.unsqueeze(0) then reduce by sum(tensor_of_partials,dim=0,keepdim=True)
+                    #but we live in a memory limited regime!
+                elif string == "huber":
+                    loss = loss + args.cumloss_scalars[idx] * conditional_loss(model_pred[idx], target[idx], reduction, loss_type="huber", cumtoggle=False)
+                elif string == "smooth_l1":
+                    loss = loss + args.cumloss_scalars[idx] * conditional_loss(model_pred[idx], target[idx], reduction, loss_type="smooth_l1", cumtoggle=False)
+                else:
+                    raise NotImplementedError(f"Unsupported accumulated Loss Type {string}")
+            return loss
 
     if loss_type == "l2":
         loss = torch.nn.functional.mse_loss(model_pred, target, reduction=reduction)
@@ -5483,15 +5515,9 @@ def conditional_loss(
         #if huber_c.size(0)>1:
         else:
             #split along batch dimension:
-            idx=0
-            loss = torch.zeroes_like(model_pred)    #container for da loss
-
-            for batch in loss:  #iterate long the batch dimension, using batchwise huber_c 
-                batchloss = torch.nn.functional.huber_loss(model_pred[idx], target[idx], reduction=reduction, delta=huber_c[idx])
-                loss[idx] = batchloss
-                idx += 1 #i haven't eaten dinner yet so i dont remember how iterators work :)
-        #else:
-        #    
+            loss = torch.zeros_like(model_pred)    #container for da loss
+            for idx, batch in enumerate(loss): #iterate long the batch dimension, using batchwise huber_c 
+                loss[idx] = torch.nn.functional.huber_loss(model_pred[idx], target[idx], reduction=reduction, delta=huber_c[idx])
 
     elif loss_type == "smooth_l1":
         #same caveat about reduction='none'. 
@@ -5501,16 +5527,10 @@ def conditional_loss(
             loss = torch.nn.functional.smooth_l1_loss(model_pred, target, reduction=reduction, beta=huber_c.item())
         #if huber_c.size(0)>1:
         else:
-            #split along batch dimension:
-            idx=0
-            loss = torch.zeroes_like(model_pred)    #container for da loss
-
-            for batch in loss:  #iterate long the batch dimension, using batchwise huber_c 
-                batchloss = torch.nn.functional.smooth_l1_loss(model_pred[idx], target[idx], reduction=reduction, beta=huber_c[idx])
-                loss[idx] = batchloss
-                idx += 1 #i haven't eaten dinner yet so i dont remember how iterators work :)
-        #else:
-        #    loss = torch.nn.functional.smooth_l1_loss(model_pred, target, reduction=reduction, beta=huber_c.item())
+            loss = torch.zeros_like(model_pred)    #container for da loss
+            #iterate long the batch dimension, using batchwise huber_c 
+            for idx, batch in enumerate(loss):
+                loss[idx] = torch.nn.functional.smooth_l1_loss(model_pred[idx], target[idx], reduction=reduction, beta=huber_c[idx])
 
     else:
         raise NotImplementedError(f"Unsupported Loss Type {loss_type}")

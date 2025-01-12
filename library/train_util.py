@@ -5490,16 +5490,19 @@ def conditional_loss(
         if args.cumloss:
             #print(args.cumloss)
             #print(args.cumloss_scalars)    #wow of course it's a dtype problem how could it be any other way.
+            #ac{cum}ulative loss passes the *same* model prediction and target to a collection of scaled functions.
+            #the results are ac{cum}ulated and returned to the user to mean across the non-batch and, eventually, batch dimensions.
+            #it is possible that backpass is contorted, sick, twisted, and confused if the loss terms are scaled before reduction but idgaf lol.
             loss = torch.zeros_like(model_pred)
             for idx, string in enumerate(args.cumloss):
                 if string == "l2":
-                    loss = loss + args.cumloss_scalars[idx] * conditional_loss(model_pred[idx], target[idx], reduction, loss_type="l2", cumtoggle=False) 
+                    loss = loss + args.cumloss_scalars[idx] * conditional_loss(model_pred, target, reduction, loss_type="l2", huber_c=huber_c, cumtoggle=False) 
                     #suspect its more operations optimal to stuff a tensor.unsqueeze(0) then reduce by sum(tensor_of_partials,dim=0,keepdim=True)
                     #but we live in a memory limited regime!
                 elif string == "huber":
-                    loss = loss + args.cumloss_scalars[idx] * conditional_loss(model_pred[idx], target[idx], reduction, loss_type="huber", cumtoggle=False)
+                    loss = loss + args.cumloss_scalars[idx] * conditional_loss(model_pred, target, reduction, loss_type="huber", huber_c=huber_c, cumtoggle=False)
                 elif string == "smooth_l1":
-                    loss = loss + args.cumloss_scalars[idx] * conditional_loss(model_pred[idx], target[idx], reduction, loss_type="smooth_l1", cumtoggle=False)
+                    loss = loss + args.cumloss_scalars[idx] * conditional_loss(model_pred, target, reduction, loss_type="smooth_l1", huber_c=huber_c, cumtoggle=False)
                 else:
                     raise NotImplementedError(f"Unsupported accumulated Loss Type {string}")
             return loss

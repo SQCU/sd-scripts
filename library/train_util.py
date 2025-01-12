@@ -3657,7 +3657,7 @@ def add_training_arguments(parser: argparse.ArgumentParser, support_dreambooth: 
         "--huber_schedule",
         type=str,
         default="snr",
-        choices=["constant", "exponential", "snr", "vsignsnr"],
+        choices=["constant", "exponential", "snr", "vsignsnr", "shiftsignsnr"],
         help="The scheduling method for Huber loss (constant, exponential, or SNR-based). Only used when loss_type is 'huber' or 'smooth_l1'. default is snr"
         + " / Huber損失のスケジューリング方法（constant、exponential、またはSNRベース）。loss_typeが'huber'または'smooth_l1'の場合に有効、デフォルトは snr",
     )
@@ -5387,8 +5387,16 @@ def get_timesteps_and_huber_c(args, min_timestep, max_timestep, noise_scheduler,
         alpha = alphas_cprd**0.5
         sigma = (1-alphas_cprd)**0.5
         twise_snr = (alpha/sigma)**2
-        logsnr = torch.sigmoid(-torch.log(twise_snr)+1)+huber_epsilon  #kept getting 'huber delta must be positive', suggesting huber_c was being compressed to 0?  
-        return logsnr*args.huber_c 
+        siglogsnr = torch.sigmoid(-torch.log(twise_snr)+1)+huber_epsilon  #kept getting 'huber delta must be positive', suggesting huber_c was being compressed to 0?  
+        return siglogsnr*args.huber_c
+
+    def hubsched_shiftsigsnr(timestep):
+        alphas_cprd = noise_scheduler.alphas_cumprod[timestep].detach()
+        alpha = alphas_cprd**0.5
+        sigma = (1-alphas_cprd)**0.5
+        twise_snr = (alpha/sigma)**2
+        siglogsnr = torch.sigmoid(-torch.log(twise_snr))+huber_epsilon  #kept getting 'huber delta must be positive', suggesting huber_c was being compressed to 0?  
+        return siglogsnr*args.huber_c+1    #minimum huber_c=1, maximum huber_c of args.huber_c+1. bc huber_c is arbitrary, it doesn't matter if the maximum value is offset.
 
     def hubsched_cnst(timestep):
         return args.huber_c
@@ -5402,6 +5410,9 @@ def get_timesteps_and_huber_c(args, min_timestep, max_timestep, noise_scheduler,
     elif args.huber_schedule == "vsignsnr":
         for idx, t in enumerate(timesteps):
             huber_coefficient[idx] = hubsched_vsigsnr(t)
+    elif args.huber_schedule == "shiftsignsnr":
+        for idx, t in enumerate(timesteps):
+            huber_coefficient[idx] = hubsched_shiftsigsnr(t)
     else: #args.huber_schedule == "constant":
         huber_coefficient = torch.tensor(hubsched_cnst(timesteps)).detach()
         #now lets make it *really* constant so the batch splitting case in conditional_loss doesn't happen!

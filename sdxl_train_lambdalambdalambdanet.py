@@ -106,26 +106,7 @@ def get_norm_params(unet: SdxlUNet2DConditionModel):     #you would never believ
 
     return prosaic_params, norming_params
 
-"""
-def get_named_params(unet: SdxlUNet2DConditionModel , namestring: str,  mask = None):
-    mask_set = set()
-    if mask:
-        mask_set = mask_set | set(mask) #please dont try and get tricky and pipe sets into this like cmon
-    prosaic_params = set()
-    perspicacious_params = set()
-    namestring = namestring.lower() # we aren't caseing where we're going
 
-    for i, (name, param) in enumerate(unet.named_parameters()):
-        if namestring in name.lower():
-            perspicacious_params.add(param)
-            if param in mask_set:
-                accelerator.print(f"{param} was pluck't but in mask_set.")
-        else:
-            prosaic_params.add(param)
-    #feel like there's probably a better way, but i'm sleepy,
-    # peels list to 2 lists, perspicacious (useful), prosaic (unselected).
-    return list(prosaic_params), list(perspicacious_params)
-"""
 def get_named_params(unet: SdxlUNet2DConditionModel , namestring: str):
     prosaic_params = []
     perspicacious_params = []
@@ -142,23 +123,6 @@ def get_named_params(unet: SdxlUNet2DConditionModel , namestring: str):
 
     return prosaic_params, perspicacious_params
 
-"""
-def we_take_bias_removal_seriously_here(self):
-    bounds = self.ab_bounds
-    if self.incremental_abolish:
-        for b in self.norm1.bias.data:
-                b = self.beta_clampy(b,self.incremental_abolish,**bounds)
-        for b in self.norm2.bias.data:
-                b = self.beta_clampy(b,self.incremental_abolish,**bounds)
-        for b in self.norm3.bias.data:
-                b = self.beta_clampy(b,self.incremental_abolish,**bounds)
-            self.incremental_abolish += 0.01
-        if self.incremental_abolish >= 1:
-                self.incremental_abolish = False
-    elif self.bias_abolisher:
-        for b in self.norm1.bias.data:
-            b = self.nonbeta_clampy(b,**bounds)
-"""
 def bias_yoinkems(unet, affinenormbiases=[]):
     usd = unet.state_dict()
     bvalues = {affinenormbias:usd[affinenormbias] for affinenormbias in affinenormbiases}
@@ -195,11 +159,6 @@ def cleanup(unet:SdxlUNet2DConditionModel, affinenormbiases=[], learnedlambdas=[
             lambdas.data = torch.clamp(lambdas.data, min=1e-2, max=2.0)     #so much exciting pedantry about leaf nodes!
             #migrating clamp action here because of suspicions about forwards pass calculation time.
 
-    """
-    def cleanup(self):
-        self.continuous_abolisher(unet, affinenormbiases=affinenormbiases)
-        self.lambda_clampbda(unet, learnedlambdas=learnedlambdas)
-    """
     continuous_abolisher(unet, affinenormbiases=affinenormbiases, incremental_abolish=incremental_abolish)
     lambda_clampbda(unet, learnedlambdas=learnedlambdas)
 
@@ -1281,7 +1240,7 @@ def setup_parser() -> argparse.ArgumentParser:
     parser.add_argument(
         "--layernorm_gradient_clipping",
         type=float,
-        default=None,
+        default=1.0,
         help="then constrain the layernorm gradients anyways.",
     )
     parser.add_argument(
@@ -1312,7 +1271,7 @@ def setup_parser() -> argparse.ArgumentParser:
     parser.add_argument(
         "--skipl_gradient_clipping",
         type=float,
-        default=None,
+        default=1.0,
         help="then constrain the skiplambda gradients anyways.",
     )
     parser.add_argument(

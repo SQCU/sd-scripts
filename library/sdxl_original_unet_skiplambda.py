@@ -44,7 +44,7 @@ CONTEXT_DIM: int = 2048
 MODEL_CHANNELS: int = 320
 TIME_EMBED_DIM = 320 * 4
 
-USE_REENTRANT = True
+USE_REENTRANT = False
 
 # region memory efficient attention
 
@@ -297,7 +297,7 @@ def get_timestep_embedding(
     assert len(timesteps.shape) == 1, "Timesteps should be a 1d-array"
 
     half_dim = embedding_dim // 2
-    exponent = -math.log(max_period) * torch.arange(start=0, end=half_dim, dtype=torch.float32, device=timesteps.device)
+    exponent = -math.log(max_period) * torch.arange(start=0, end=half_dim, dtype=torch.bfloat16, device=timesteps.device)
     exponent = exponent / (half_dim - downscale_freq_shift)
 
     emb = torch.exp(exponent)
@@ -334,9 +334,12 @@ def resize_like(x, target, mode="bicubic", align_corners=False):
 
 class GroupNorm32(nn.GroupNorm):
     def forward(self, x):
+        return super().forward(x)
+    """
         if self.weight.dtype != torch.float32:
             return super().forward(x)
         return super().forward(x.float()).type(x.dtype)
+    """
 
 
 class ResnetBlock2D(nn.Module):
@@ -350,7 +353,7 @@ class ResnetBlock2D(nn.Module):
         self.out_channels = out_channels
 
         self.in_layers = nn.Sequential(
-            GroupNorm32(32, in_channels),
+            torch.nn.GroupNorm(32, in_channels),
             nn.SiLU(),
             nn.Conv2d(in_channels, out_channels, kernel_size=3, stride=1, padding=1),
         )
@@ -358,7 +361,7 @@ class ResnetBlock2D(nn.Module):
         self.emb_layers = nn.Sequential(nn.SiLU(), nn.Linear(TIME_EMBED_DIM, out_channels))
 
         self.out_layers = nn.Sequential(
-            GroupNorm32(32, out_channels),
+            torch.nn.GroupNorm(32, out_channels),
             nn.SiLU(),
             nn.Identity(),  # to make state_dict compatible with original model
             nn.Conv2d(out_channels, out_channels, kernel_size=3, stride=1, padding=1),
@@ -466,9 +469,10 @@ class CrossAttention(nn.Module):
         self.use_laser_sdpa = False
         self.use_qknorm = False
         self.use_laser_qknorm = False
-        self.use_qklayernorm = False #keep this one in the back pocket
+        self.qkprojnorm = None #keep this one in the back pocket
 
         self.qkn_gnought = nn.Parameter(torch.tensor(8.0))
+        #self.qkn_gnought = False
         #self.qkn_gnought.requires_grad_(False)  #maybe this will stop non-qknorm runs from frying! haha this is pytorch something bad will happen anyways.
 
     def set_use_memory_efficient_attention(self, xformers, mem_eff):
@@ -489,6 +493,9 @@ class CrossAttention(nn.Module):
     def set_use_laser_qknorm(self, qknorm: bool):
         self.use_laser_qknorm = qknorm
         self.qkn_gnought.requires_grad_(True)
+
+    def set_use_layerqknorm(self, layerqknorm: bool):
+        self.qkprojnorm = dynamic_shape_layernorm()
 
     def reshape_heads_to_batch_dim(self, tensor):
         batch_size, seq_len, dim = tensor.shape
@@ -512,7 +519,9 @@ class CrossAttention(nn.Module):
         if self.use_laser_qknorm:
             return self.laser_preattn_qknorm(hidden_states, context, mask)
         if self.use_laser_sdpa: #and self.use_sdpa:
-            return self.laser_preattn_sdpa(hidden_states, context, mask)
+            #return self.laser_preattn_sdpa(hidden_states, context, mask)
+            #use new more-compact wrapper
+            return self.forward_sdpa(hidden_states, context, mask)
         if self.use_sdpa:
             return self.forward_sdpa(hidden_states, context, mask)
 
@@ -526,7 +535,6 @@ class CrossAttention(nn.Module):
         value = self.reshape_heads_to_batch_dim(value)
 
         if self.use_qknorm: # look im just tryna edit all this code in place instead of refactoring control flow
-            #hidden_states = qk_layer_normed_attention(query=query, key=key, value=value, attn_mask=mask, dropout_p=0.0, is_causal=False, scale=self.qkn_gnought)
             hidden_states = qk_layer_normed_attention(query=query, key=key, value=value, attn_mask=mask, dropout_p=0.0, is_causal=False, scale=self.qkn_gnought.item())
             hidden_states = self.reshape_batch_dim_to_heads(hidden_states)
         else: #default case
@@ -609,6 +617,7 @@ class CrossAttention(nn.Module):
         out = self.to_out[0](out)
         return out
 
+
     def forward_sdpa(self, x, context=None, mask=None):
         h = self.heads
         q_in = self.to_q(x)
@@ -616,17 +625,32 @@ class CrossAttention(nn.Module):
         context = context.to(x.dtype)
         k_in = self.to_k(context)
         v_in = self.to_v(context)
-
+        if self.use_laser_sdpa:
+            valueoffset_biggymax, indices = torch.max(v_in, axis=1, keepdim=True)
+            del indices
+            v_in = torch.exp(v_in - valueoffset_biggymax).to(dtype=torch.bfloat16)
+        
         q, k, v = map(lambda t: rearrange(t, "b n (h d) -> b h n d", h=h), (q_in, k_in, v_in))  
         del q_in, k_in, v_in
 
-        out = F.scaled_dot_product_attention(q, k, v, attn_mask=mask, dropout_p=0.0, is_causal=False)
-
-        out = rearrange(out, "b h n d -> b n (h d)", h=h)
-
+        if self.use_laser_sdpa:
+            if self.qkprojnorm is not None:
+                qkfunction = self.qkprojnorm
+            else:
+                qkfunction = nn.Identity()
+            q = qkfunction(q)
+            k = qkfunction(k)
+            out = F.scaled_dot_product_attention(q, k, v, attn_mask=mask, dropout_p=0.0, is_causal=False)
+            out = rearrange(out, "b h n d -> b n (h d)", h=h) #oops transpose has to come before shift
+            out = torch.log(out) + valueoffset_biggymax
+            del valueoffset_biggymax
+        else:
+            out = F.scaled_dot_product_attention(q, k, v, attn_mask=mask, dropout_p=0.0, is_causal=False)
+            out = rearrange(out, "b h n d -> b n (h d)", h=h)
         out = self.to_out[0](out)
         return out
 
+    #deprecated?
     def laser_preattn_sdpa(self, x, context=None, mask=None):
         #stock impl
         h = self.heads
@@ -707,6 +731,28 @@ class CrossAttention(nn.Module):
         out = self.to_out[0](out)
         return out
 
+class dynamic_shape_rmsnorm(nn.Module):
+    def forward(self, inputter, **kwargs):
+        inputter = inputter.transpose(1,2)  #rotate!
+        #i am so sorry haha
+        #normalized_shape seems to require adjacencies, i tried a few other things first.
+        inner_shape = inputter.size()[3:]   
+
+        nn.functional.rms_norm(inputter, normalized_shape=inner_shape, **kwargs)   
+        inputter = inputter.transpose(1,2)                  #reverse rotate!
+        return inputter
+
+class dynamic_shape_layernorm(nn.Module):
+    def forward(self, inputter, **kwargs):
+        inputter = inputter.transpose(1,2)  #rotate!
+        #i am so sorry haha
+        #normalized_shape seems to require adjacencies, i tried a few other things first.
+        inner_shape = inputter.size()[3:]   
+
+        nn.functional.layer_norm(inputter, normalized_shape=inner_shape, **kwargs)   
+        inputter = inputter.transpose(1,2)                  #reverse rotate!
+        return inputter
+
 # feedforward
 class GEGLU(nn.Module):
     r"""
@@ -723,9 +769,10 @@ class GEGLU(nn.Module):
 
     def gelu(self, gate):
         if gate.device.type != "mps":
-            return F.gelu(gate)
-        # mps: gelu is not implemented for float16
-        return F.gelu(gate.to(dtype=torch.float32)).to(dtype=gate.dtype)
+            return F.gelu(gate, approximate='tanh')
+        # mps: gelu is not implemented for float16 
+        # is that true?
+        return F.gelu(gate.to(dtype=torch.bfloat16), approximate='tanh').to(dtype=gate.dtype)
 
     def forward(self, hidden_states):
         hidden_states, gate = self.proj(hidden_states).chunk(2, dim=-1)
@@ -812,6 +859,10 @@ class BasicTransformerBlock(nn.Module):
     def set_use_laser_qknorm(self, qknorm: bool):
         self.attn1.set_use_laser_qknorm(qknorm)
         self.attn2.set_use_laser_qknorm(qknorm)
+
+    def set_use_layerqknorm(self, layerqknorm: bool):
+        self.attn1.set_use_layerqknorm(layerqknorm)
+        self.attn2.set_use_layerqknorm(layerqknorm)
     
 
     def forward_body(self, hidden_states, context=None, timestep=None):
@@ -849,7 +900,6 @@ class BasicTransformerBlock(nn.Module):
 
         return output
 
-
 class Transformer2DModel(nn.Module):
     def __init__(
         self,
@@ -870,6 +920,7 @@ class Transformer2DModel(nn.Module):
 
         self.norm = torch.nn.GroupNorm(num_groups=32, num_channels=in_channels, eps=1e-6, affine=True)
         # self.norm = GroupNorm32(32, in_channels, eps=1e-6, affine=True)
+        self.learnedlambda1 = nn.Parameter(torch.tensor(0.5))
 
         if use_linear_projection:
             self.proj_in = nn.Linear(in_channels, inner_dim)
@@ -915,7 +966,11 @@ class Transformer2DModel(nn.Module):
 
     def set_use_laser_qknorm(self, qknorm: bool):
         for transformer in self.transformer_blocks:
-            transformer.set_use_laser_qknorm(qknorm)   
+            transformer.set_use_laser_qknorm(qknorm)  
+
+    def set_use_layerqknorm(self, layerqknorm: bool):
+        for transformer in self.transformer_blocks:
+            transformer.set_use_layerqknorm(layerqknorm)
 
     def forward(self, hidden_states, encoder_hidden_states=None, timestep=None):
         # 1. Input
@@ -944,7 +999,7 @@ class Transformer2DModel(nn.Module):
             hidden_states = self.proj_out(hidden_states)
             hidden_states = hidden_states.reshape(batch, height, weight, inner_dim).permute(0, 3, 1, 2).contiguous()
 
-        output = hidden_states + residual
+        output = hidden_states + self.learnedlambda1*residual
 
         return output
 
@@ -964,9 +1019,11 @@ class Upsample2D(nn.Module):
         # Cast to float32 to as 'upsample_nearest2d_out_frame' op does not support bfloat16
         # TODO(Suraj): Remove this cast once the issue is fixed in PyTorch
         # https://github.com/pytorch/pytorch/issues/86679
+        """
         dtype = hidden_states.dtype
         if dtype == torch.bfloat16:
             hidden_states = hidden_states.to(torch.float32)
+        """
 
         # upsample_nearest_nhwc fails with large batch sizes. see https://github.com/huggingface/diffusers/issues/984
         if hidden_states.shape[0] >= 64:
@@ -978,9 +1035,11 @@ class Upsample2D(nn.Module):
         else:
             hidden_states = F.interpolate(hidden_states, size=output_size, mode="nearest")
 
+        """
         # If the input is bfloat16, we cast back to bfloat16
         if dtype == torch.bfloat16:
             hidden_states = hidden_states.to(dtype)
+        """
 
         hidden_states = self.conv(hidden_states)
 
@@ -1202,7 +1261,7 @@ class SdxlUNet2DConditionModel(nn.Module):
 
         # output
         self.out = nn.ModuleList(
-            [GroupNorm32(32, self.model_channels), nn.SiLU(), nn.Conv2d(self.model_channels, self.out_channels, 3, padding=1)]
+            [torch.nn.GroupNorm(32, self.model_channels), nn.SiLU(), nn.Conv2d(self.model_channels, self.out_channels, 3, padding=1)]
         )
 
     # region diffusers compatibility
@@ -1268,6 +1327,13 @@ class SdxlUNet2DConditionModel(nn.Module):
             for module in block:
                 if hasattr(module, "set_use_laser_qknorm"):
                      module.set_use_laser_qknorm(qknorm)
+
+    def set_use_layerqknorm(self, layerqknorm: bool) -> None:
+        blocks = self.input_blocks + [self.middle_block] + self.output_blocks
+        for block in blocks:
+            for module in block:
+                if hasattr(module, "set_use_layerqknorm"):
+                    module.set_use_layerqknorm(layerqknorm)
 
     def set_gradient_checkpointing(self, value=False):
         blocks = self.input_blocks + [self.middle_block] + self.output_blocks

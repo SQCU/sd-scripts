@@ -932,7 +932,8 @@ class SdxlStableDiffusionLongPromptWeightingPipeline:
         unet_dtype = self.unet.dtype
         dtype = unet_dtype
         if hasattr(dtype, "itemsize") and dtype.itemsize == 1:  # fp8
-            dtype = torch.float16
+            #dtype = torch.float16
+            #wtf was this
             self.unet.to(dtype)
 
         # 4. Preprocess image and mask

@@ -5710,7 +5710,7 @@ def sample_images_common(
     unet,
     prompt_replacement=None,
     controlnet=None,
-    **kwargs
+    kwargs=None
 ):
     """
     StableDiffusionLongPromptWeightingPipelineの改造版を使うようにしたので、clip skipおよびプロンプトの重みづけに対応した
@@ -5760,16 +5760,19 @@ def sample_images_common(
     elif args.sample_prompts.endswith(".json"):
         with open(args.sample_prompts, "r", encoding="utf-8") as f:
             prompts = json.load(f)
+    if kwargs == None:
+        kwargs={}
+        #safeguard against creating a global dict for all calls of this fn or something.
 
-    # schedulers: dict = {}  cannot find where this is used
+    beta_parameterization_keys = ("num_train_timesteps","beta_start","beta_end","beta_schedule")
+    scheduler_kwargs = {key:kwargs[key] for key in kwargs.keys() if key in beta_parameterization_keys}
+    if scheduler_kwargs:
+        logger.info(f"nonstandard betas suspected:{scheduler_kwargs}")
+
     default_scheduler = get_my_scheduler(
         sample_sampler=args.sample_sampler,
         v_parameterization=args.v_parameterization,
-        #num_train_timesteps=kwargs["num_train_timesteps"],
-        #beta_start=kwargs["beta_start"],
-        #beta_end=kwargs["beta_end"],
-        #beta_schedule=kwargs["beta_schedule"]
-        **kwargs
+        **scheduler_kwargs #unpack noise schedule terms so they can override architecture defaults
     )
 
     pipeline = pipe_class(
@@ -5879,11 +5882,13 @@ def sample_image_inference(
         torch.seed()
         torch.cuda.seed()
 
-    scheduler = get_my_scheduler(
-        sample_sampler=sampler_name,
-        v_parameterization=args.v_parameterization,
-    )
-    pipeline.scheduler = scheduler
+    #wait this overrides the scheduler which was just constructed in the calling method?
+    #this method is only ever called by sample_images_common. what is going on here?
+    #scheduler = get_my_scheduler(
+    #    sample_sampler=sampler_name,
+    #    v_parameterization=args.v_parameterization,
+    #)
+    #pipeline.scheduler = scheduler
 
     if controlnet_image is not None:
         controlnet_image = Image.open(controlnet_image).convert("RGB")

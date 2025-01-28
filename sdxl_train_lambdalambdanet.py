@@ -1260,7 +1260,7 @@ def setup_parser() -> argparse.ArgumentParser:
     parser.add_argument(
         "--layernorm_gradient_clipping",
         type=float,
-        default=None,
+        default=1.0,
         help="then constrain the layernorm gradients anyways.",
     )
     parser.add_argument(
@@ -1291,7 +1291,7 @@ def setup_parser() -> argparse.ArgumentParser:
     parser.add_argument(
         "--skipl_gradient_clipping",
         type=float,
-        default=None,
+        default=1.0,
         help="then constrain the skiplambda gradients anyways.",
     )
     parser.add_argument(

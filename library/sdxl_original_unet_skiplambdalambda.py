@@ -253,7 +253,7 @@ def get_timestep_embedding(
     assert len(timesteps.shape) == 1, "Timesteps should be a 1d-array"
 
     half_dim = embedding_dim // 2
-    exponent = -math.log(max_period) * torch.arange(start=0, end=half_dim, dtype=torch.float32, device=timesteps.device)
+    exponent = -math.log(max_period) * torch.arange(start=0, end=half_dim, dtype=torch.bfloat16, device=timesteps.device)
     exponent = exponent / (half_dim - downscale_freq_shift)
 
     emb = torch.exp(exponent)
@@ -292,9 +292,12 @@ def resize_like(x, target, mode="bicubic", align_corners=False):
 
 class GroupNorm32(nn.GroupNorm):
     def forward(self, x):
+        """
         if self.weight.dtype != torch.float32:
             return super().forward(x)
         return super().forward(x.float()).type(x.dtype)
+        """
+        return super().forward(x)
 
 
 class ResnetBlock2D(nn.Module):
@@ -585,7 +588,7 @@ class CrossAttention(nn.Module):
         #scary einops transpose
         q, k, v = map(lambda t: rearrange(t, "b n (h d) -> b h n d", h=h), (q_in, k_in, v_in))
         del q_in, k_in, v_in
-        
+
         #stock impl
         out = F.scaled_dot_product_attention(q, k, v, attn_mask=mask, dropout_p=0.0, is_causal=False)
         
@@ -617,11 +620,10 @@ class GEGLU(nn.Module):
 
     def gelu(self, gate):
         if gate.device.type != "mps":
-            return F.gelu(gate)
-        # mps: gelu is not implemented for float16
-        # docs don't entirely agree?
-        return F.gelu(gate.to(dtype=torch.float32)).to(dtype=gate.dtype)
-        #return F.gelu(gate)
+            return F.gelu(gate, approximate='tanh')
+        # mps: gelu is not implemented for float16 
+        # is that true?
+        return F.gelu(gate.to(dtype=torch.bfloat16), approximate='tanh').to(dtype=gate.dtype)
 
     def forward(self, hidden_states):
         hidden_states, gate = self.proj(hidden_states).chunk(2, dim=-1)

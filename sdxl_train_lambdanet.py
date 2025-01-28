@@ -12,6 +12,8 @@ from tqdm import tqdm
 import torch
 from library.device_utils import init_ipex, clean_memory_on_device
 
+from torchjd import backward
+from torchjd.aggregation import UPGrad
 
 init_ipex()
 
@@ -139,7 +141,7 @@ def nonbeta_clampy(term_for_clampy, mink=None, maxk=None):
 def cleanup(unet:SdxlUNet2DConditionModel, affinenormbiases=[], learnedlambdas=[], incremental_abolish=None):
     # we want norm123.bias.data
     usd = unet.state_dict()
-    def continuous_abolisher(unet:SdxlUNet2DConditionModel, affinenormbiases=[], incremental_abolish=[]):
+    def continuous_abolisher(unet:SdxlUNet2DConditionModel, affinenormbiases=[], incremental_abolish=None):
         for bias in affinenormbiases:
             if incremental_abolish:
                 usd[str(bias)] = beta_clampy(usd[str(bias)], incremental_abolish[0], mink=0, maxk=2)
@@ -192,7 +194,7 @@ def train(args):
 
     skipweight_params = []
     affinenormbiases= []
-    incremental_abolish= []
+    incremental_abolish_ls = []
 
     assert (
         not args.weighted_captions
@@ -360,6 +362,10 @@ def train(args):
         logger.info("Enable laser-qk-norm for U-Net, you scoundrel ;')")
         unet.set_use_laser_qknorm(True)
 
+    if args.use_layerqknorm:
+        logger.info("Enable layer-qk-norm for U-Net, you scoundrel ;')")
+        unet.set_use_layerqknorm(True)
+
     # 学習を準備する
     if cache_latents:
         vae.to(accelerator.device, dtype=vae_dtype)
@@ -450,12 +456,19 @@ def train(args):
         clippables = clippables_beta
         #norm_params.requires_grad_(True)
     if args.bias_abolisher:
+        biasfilter = ('norm1', 'norm2', 'norm3')
         for name, param in unet.named_parameters():
-            if 'norm1' in name or 'norm2' in name or 'norm3' in name:
+            if 'norm1' in name or 'norm2' in name or 'norm3' in name and 'model.diffusion_model' in name:
                 if 'bias' in name:
                     affinenormbiases.append(name)
+            else:
+                if args.groupnorm_bias_abolisher_auxiliary:
+                    #if 'norm' in name or 'GroupNorm' in name:
+                    if 'norm' in name or 'GroupNorm' in name and 'model.diffusion_model' in name:
+                        if 'bias' in name:
+                            affinenormbiases.append(name)
     if args.incremental_abolish:
-        incremental_abolish.append(args.incremental_abolish)
+        incremental_abolish_ls.append(args.incremental_abolish)
 
 
     if train_text_encoder1:
@@ -535,13 +548,12 @@ def train(args):
 
     else:
         _, _, optimizer = train_util.get_optimizer(args, trainable_params=params_to_optimize)
+        aggregator = UPGrad()
         if args.norm_salvation: #dict notation is here for a rason. veary import raseon.
             norms_kv ={"weight_decay":args.layernorm_decay}
             if args.layernorm_adambetas is not None:
-                #lynmabval = tuple(args.layernorm_adambetas)
                 norms_kv["betas"]=tuple(args.layernorm_adambetas)
             if args.layernorm_lr is not None:
-                #lynmlr = args.layernorm_lr
                 norms_kv["lr"]=args.layernorm_lr
             #global_optim_man=optimizer.mng
             optimizer.mng.override_config(parameters=norm_params, key_value_dict=norms_kv)
@@ -732,7 +744,7 @@ def train(args):
                                         cleanup(
                                             model, affinenormbiases=affinenormbiases, 
                                             learnedlambdas=skipweight_params, 
-                                            incremental_abolish=args.incremental_abolish)
+                                            incremental_abolish=incremental_abolish_ls)
 
                         parameter.register_post_accumulate_grad_hook(optimizer_hook)
                         parameter_optimizer_map[parameter] = opt_idx
@@ -766,10 +778,13 @@ def train(args):
         noise_scheduler = DDPMScheduler(
             beta_start=0.00085, beta_end=(0.012*math.sqrt(args.sigmaximum_overdrive/256)), beta_schedule=args.beta_schedule, num_train_timesteps=1000, clip_sample=False
         )
+        #beta_parameterization_keys = ("num_train_timesteps","beta_start","beta_end","beta_schedule")
+        betascale_kwargs={"num_train_timesteps":1000,"beta_start":0.00085,"beta_end":(0.012*math.sqrt(args.sigmaximum_overdrive/256)),"beta_schedule":args.beta_schedule}
     else:    
         noise_scheduler = DDPMScheduler(
             beta_start=0.00085, beta_end=0.012, beta_schedule=args.beta_schedule, num_train_timesteps=1000, clip_sample=False
         )
+        betascale_kwargs={}
     prepare_scheduler_for_custom_training(noise_scheduler, accelerator.device)
     if args.zero_terminal_snr:
         custom_train_functions.fix_noise_scheduler_betas_for_zero_terminal_snr(noise_scheduler)
@@ -788,7 +803,8 @@ def train(args):
 
     # For --sample_at_first
     sdxl_train_util.sample_images(
-        accelerator, args, 0, global_step, accelerator.device, vae, [tokenizer1, tokenizer2], [text_encoder1, text_encoder2], unet
+        accelerator, args, 0, global_step, accelerator.device, vae, [tokenizer1, tokenizer2], [text_encoder1, text_encoder2], unet,
+        kwargs=betascale_kwargs
     )
 
     loss_recorder = train_util.LossRecorder()
@@ -925,7 +941,11 @@ def train(args):
                     )
                     if args.masked_loss or ("alpha_masks" in batch and batch["alpha_masks"] is not None):
                         loss = apply_masked_loss(loss, batch)
-                    loss = loss.mean([1, 2, 3]) #mean over non-batch dimensions
+                    if args.use_torchjd:
+                        loss = loss.mean([1, 2, 3])
+                        #don't mean for torchjd backward case?
+                    else:
+                        loss = loss.mean([1, 2, 3]) #mean over non-batch dimensions
                     #but wait, does that even matter if the loss weighting is samplewise, 
                     #e.g. bc the timestep parameter only varies along batch dimension?
                     #this should already work fine with huber and smoothed loss. not sure why this wasn't in place forever ago.
@@ -949,14 +969,26 @@ def train(args):
                         loss = apply_salimans_vpred_weighting(loss, timesteps, noise_scheduler, v_prediction=args.v_parameterization)
                     if args.sigmoid_k_weighting:
                         loss = apply_sigmoid_k_weighting(loss, timesteps, noise_scheduler, v_prediction=args.v_parameterization, k_const=args.sigmoid_k_weighting)
-
-                    loss = loss.mean()  # mean over batch dimension
+                    
+                    if args.use_torchjd:
+                        loss = loss
+                        #batchsize = loss.size(0) # get batch 
+                        #losses = loss.chunk(chunks=batchsize, dim=0)
+                    else:
+                        loss = loss.mean()  # mean over batch dimension
                 else:
                     loss = train_util.conditional_loss(
                         noise_pred.float(), target.float(), reduction="mean", loss_type=args.loss_type, huber_c=huber_c
                     )
 
-                accelerator.backward(loss) #+z_list
+                # this is only a convenience wrapper wtf!
+                if args.use_torchjd:
+                    #loss.backward()
+                    #mtl_backward(losses=losses, features=features, aggregator=aggregator)
+                    backward(loss, aggregator)
+                else:
+                    accelerator.backward(loss) #+z_list
+                
 
                 if not (args.fused_backward_pass or args.fused_optimizer_groups):
                     #post-backpass non-hooked grad clipping implementation.
@@ -979,8 +1011,9 @@ def train(args):
                     lr_scheduler.step()
                     optimizer.zero_grad(set_to_none=True)
                     if args.bias_abolisher:
-                        for model in accelerator._models:
-                            cleanup( model, affinenormbiases=affinenormbiases, learnedlambdas=skipweight_params, incremental_abolish=args.incremental_abolish)
+                        #for model in accelerator._models:
+                        #    cleanup( model, affinenormbiases=affinenormbiases, learnedlambdas=skipweight_params, incremental_abolish=incremental_abolish_ls)
+                        cleanup(unet, affinenormbiases=affinenormbiases, learnedlambdas=skipweight_params, incremental_abolish=incremental_abolish_ls)
                 else:
                     # optimizer.step() and optimizer.zero_grad() are called in the optimizer hook
                     lr_scheduler.step()
@@ -1003,6 +1036,7 @@ def train(args):
                     [tokenizer1, tokenizer2],
                     [text_encoder1, text_encoder2],
                     unet,
+                    kwargs=betascale_kwargs
                 )
 
                 # 指定ステップごとにモデルを保存
@@ -1087,6 +1121,7 @@ def train(args):
             [tokenizer1, tokenizer2],
             [text_encoder1, text_encoder2],
             unet,
+            kwargs=betascale_kwargs
         )
 
     is_main_process = accelerator.is_main_process
@@ -1212,6 +1247,12 @@ def setup_parser() -> argparse.ArgumentParser:
         help="get rid of layernorm biases.",
     )
     parser.add_argument(
+        "--groupnorm_bias_abolisher_auxiliary",
+        action="store_true",
+        default=None,
+        help="get rid of groupnorm affine biases too.",
+    )
+    parser.add_argument(
         "--incremental_abolish",
         type=float,
         default=None,
@@ -1240,6 +1281,18 @@ def setup_parser() -> argparse.ArgumentParser:
         action="store_true",
         default=None,
         help="rescale those numbers, then rescale query, key to minimize saturation. also another learnable parameter :)",
+    )
+    parser.add_argument(
+        "--use_layerqknorm",
+        action="store_true",
+        default=None,
+        help="rescale those numbers, then rescale query, key to minimize saturation. no learnable parameter :)",
+    )
+    parser.add_argument(
+        "--use_torchjd",
+        action="store_true",
+        default=None,
+        help="multiple gradient loss",
     )
     return parser
 

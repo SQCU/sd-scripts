@@ -138,15 +138,26 @@ def nonbeta_clampy(term_for_clampy, mink=None, maxk=None):
     #return torch.clamp_(term_for_clampy,min=mink, max=maxk)
     torch.clamp_(term_for_clampy,min=mink, max=maxk)
 
-def cleanup(unet:SdxlUNet2DConditionModel, affinenormbiases=[], learnedlambdas=[], incremental_abolish=None):
+def cleanup(unet:SdxlUNet2DConditionModel, affinenormbiases=[], affinenormweights=[], learnedlambdas=[], incremental_abolish=None):
     # we want norm123.bias.data
     usd = unet.state_dict()
-    def continuous_abolisher(unet:SdxlUNet2DConditionModel, affinenormbiases=[], incremental_abolish=None):
+    def continuous_abolisher(unet:SdxlUNet2DConditionModel, affinenormbiases=[], affinenormweights=[], incremental_abolish=None):
         for bias in affinenormbiases:
             if incremental_abolish:
                 usd[str(bias)] = beta_clampy(usd[str(bias)], incremental_abolish[0], mink=0, maxk=2)
             else:
                 nonbeta_clampy(usd[str(bias)], mink=0, maxk=2)
+
+        for weight in affinenormweights:
+            wei = usd[str(weight)]
+            weitarget = 1 #"""for a*gamma equals a nonoperation"""
+            local_epsilon = 1e-08 # look... i...
+            if incremental_abolish:
+                #can't use unless inc_abolish exists!
+                inc_alpha = 1 - incremental_abolish[0] 
+                wei = beta_clampy(wei, incremental_abolish[0], mink=weitarget-inc_alpha, maxk=weitarget+inc_alpha)
+            else: 
+                nonbeta_clampy(wei, mink=weitarget-local_epsilon, maxk=weitarget+local_epsilon)
         
         if incremental_abolish:
             incremental_abolish[0] = incremental_abolish[0]+0.01    #its so funny having to write an iterator in pydiom.
@@ -159,7 +170,7 @@ def cleanup(unet:SdxlUNet2DConditionModel, affinenormbiases=[], learnedlambdas=[
             lambdas.data = torch.clamp(lambdas.data, min=1e-2, max=2.0)     #so much exciting pedantry about leaf nodes!
             #migrating clamp action here because of suspicions about forwards pass calculation time.
 
-    continuous_abolisher(unet, affinenormbiases=affinenormbiases, incremental_abolish=incremental_abolish)
+    continuous_abolisher(unet, affinenormbiases=affinenormbiases, affinenormweights=affinenormweights, incremental_abolish=incremental_abolish)
     lambda_clampbda(unet, learnedlambdas=learnedlambdas)
 
 def append_block_lr_to_logs(block_lrs, logs, lr_scheduler, optimizer_type):
@@ -194,6 +205,7 @@ def train(args):
 
     skipweight_params = []
     affinenormbiases= []
+    affinenormweights= []
     incremental_abolish_ls = []
 
     assert (
@@ -299,6 +311,10 @@ def train(args):
     vae_dtype = torch.float32 if args.no_half_vae else weight_dtype
 
     # モデルを読み込む
+    # unet loaded here!!!
+    # add keys to initdict{} here to pipe configuration to model init
+    initdict={}
+    initdict.update({"learnable_lambdas_level":args.learnable_lambdas_level})
     (
         load_stable_diffusion_format,
         text_encoder1,
@@ -307,7 +323,7 @@ def train(args):
         unet,
         logit_scale,
         ckpt_info,
-    ) = sdxl_train_util.load_target_model(args, accelerator, "sdxl", weight_dtype)
+    ) = sdxl_train_util.load_target_model(args, accelerator, "sdxl", weight_dtype, initdict=initdict)
     # logit_scale = logit_scale.to(accelerator.device, dtype=weight_dtype)
 
     # verify load/save model formats
@@ -436,6 +452,9 @@ def train(args):
     if not train_unet:
         unet.to(accelerator.device, dtype=weight_dtype)  # because of unet is not prepared
 
+    logger.info("disable grad on unused learnable_lambdas")
+    unet.set_lambdagrad_hard_recurse(args.learnable_lambdas_level)
+
     training_models = []
     params_to_optimize = []
     if train_unet:
@@ -447,14 +466,12 @@ def train(args):
 
     if args.norm_salvation:
         clippables, norm_params = get_norm_params(unet)
-        #norm_params.requires_grad_(True)
     clippables_beta, skipweight_params = get_named_params(unet=unet, namestring="learnedlambda") # mask=norm_params)
     if clippables:
         clippables = set(clippables) - set(clippables_beta)
         clippables = list(clippables)
     else:
         clippables = clippables_beta
-        #norm_params.requires_grad_(True)
     if args.bias_abolisher:
         biasfilter = ('norm1', 'norm2', 'norm3')
         for name, param in unet.named_parameters():
@@ -467,9 +484,20 @@ def train(args):
                     if 'norm' in name or 'GroupNorm' in name and 'model.diffusion_model' in name:
                         if 'bias' in name:
                             affinenormbiases.append(name)
+    if args.layernorm_simple:   # should be roughly equivalent to bias_abolisher, 
+                                #but interpolate between layernorm and layernorm-simple
+        modulefilter = ('norm1', 'norm2', 'norm3')
+        #subparamfilter = ('bias', 'weight')
+        for name, param in unet.named_parameters():
+            for mod in modulefilter:
+                if mod in name:
+                    if 'bias' in name:
+                        affinenormbiases.append(name)
+                    if 'weight' in name:
+                        affinenormweights.append(name)
+    
     if args.incremental_abolish:
         incremental_abolish_ls.append(args.incremental_abolish)
-
 
     if train_text_encoder1:
         training_models.append(text_encoder1)
@@ -498,6 +526,10 @@ def train(args):
     if args.norm_salvation:
         accelerator.print(f"number of split norm parameters: {n_norm_params}")
         accelerator.print(f"number of split non-norm parameters: {n_notnorm_params}\nplease be {n_params-n_norm_params}.")
+    if args.bias_abolisher or args.layernorm_simple:
+        accelerator.print(f"onload biasminmax:{bias_yoinkems(unet=unet,affinenormbiases=affinenormbiases)}")
+    if args.layernorm_simple:
+        accelerator.print(f"onload weightminmax:{bias_yoinkems(unet=unet,affinenormbiases=affinenormweights)}")
 
     # 学習に必要なクラスを準備する
     accelerator.print("prepare optimizer, data loader etc.")
@@ -558,6 +590,11 @@ def train(args):
             #global_optim_man=optimizer.mng
             optimizer.mng.override_config(parameters=norm_params, key_value_dict=norms_kv)
             logger.info(f"using {norms_kv} overrides to optimizer config.")
+        
+        lskip_kv ={"weight_decay":0}
+
+        optimizer.mng.override_config(parameters=skipweight_params, key_value_dict=lskip_kv)
+        logger.info(f"using {lskip_kv} overrides to skipweight optimizer config.")
 
     # dataloaderを準備する
     # DataLoaderのプロセス数：0 は persistent_workers が使えないので注意
@@ -739,10 +776,10 @@ def train(args):
                             if optimizer_hooked_count[i] == num_parameters_per_group[i]:
                                 optimizers[i].step()
                                 optimizers[i].zero_grad(set_to_none=True)
-                                if args.bias_abolisher:
+                                if args.bias_abolisher or args.layernorm_simple:
                                     for model in accelerator._models:
                                         cleanup(
-                                            model, affinenormbiases=affinenormbiases, 
+                                            model, affinenormbiases=affinenormbiases, affinenormweights=affinenormweights, 
                                             learnedlambdas=skipweight_params, 
                                             incremental_abolish=incremental_abolish_ls)
 
@@ -942,7 +979,7 @@ def train(args):
                     if args.masked_loss or ("alpha_masks" in batch and batch["alpha_masks"] is not None):
                         loss = apply_masked_loss(loss, batch)
                     if args.use_torchjd:
-                        loss = loss.mean([1, 2, 3])
+                        loss = loss
                         #don't mean for torchjd backward case?
                     else:
                         loss = loss.mean([1, 2, 3]) #mean over non-batch dimensions
@@ -1010,10 +1047,10 @@ def train(args):
                     optimizer.step()
                     lr_scheduler.step()
                     optimizer.zero_grad(set_to_none=True)
-                    if args.bias_abolisher:
+                    if args.bias_abolisher or args.layernorm_simple:
                         #for model in accelerator._models:
                         #    cleanup( model, affinenormbiases=affinenormbiases, learnedlambdas=skipweight_params, incremental_abolish=incremental_abolish_ls)
-                        cleanup(unet, affinenormbiases=affinenormbiases, learnedlambdas=skipweight_params, incremental_abolish=incremental_abolish_ls)
+                        cleanup(unet, affinenormbiases=affinenormbiases, affinenormweights=affinenormweights, learnedlambdas=skipweight_params, incremental_abolish=incremental_abolish_ls)
                 else:
                     # optimizer.step() and optimizer.zero_grad() are called in the optimizer hook
                     lr_scheduler.step()
@@ -1062,8 +1099,10 @@ def train(args):
                             logit_scale,
                             ckpt_info,
                         )
-                        if args.bias_abolisher:
+                        if args.bias_abolisher or args.layernorm_simple:
                             accelerator.print(f"onsave biasminmax:{bias_yoinkems(unet=unet,affinenormbiases=affinenormbiases)}")
+                        if args.layernorm_simple:
+                            accelerator.print(f"onsave weightminmax:{bias_yoinkems(unet=unet,affinenormbiases=affinenormweights)}")
 
             current_loss = loss.detach().item()  # 平均なのでbatch sizeは関係ないはず
             if args.logging_dir is not None:
@@ -1131,8 +1170,10 @@ def train(args):
     text_encoder2 = accelerator.unwrap_model(text_encoder2)
 
     accelerator.end_training()
-    if args.bias_abolisher:
-        accelerator.print(f"trainendbiasminmax:{bias_yoinkems(unet=unet,affinenormbiases=affinenormbiases)}")
+    if args.bias_abolisher or args.layernorm_simple:
+        accelerator.print(f"onsave biasminmax:{bias_yoinkems(unet=unet,affinenormbiases=affinenormbiases)}")
+    if args.layernorm_simple:
+        accelerator.print(f"onsave weightminmax:{bias_yoinkems(unet=unet,affinenormbiases=affinenormweights)}")
 
     if args.save_state or args.save_state_on_train_end:
         train_util.save_state_on_train_end(args, accelerator)
@@ -1210,6 +1251,12 @@ def setup_parser() -> argparse.ArgumentParser:
         help="number of optimizers for fused backward pass and optimizer step / fused backward passとoptimizer stepのためのoptimizer数",
     )
     parser.add_argument(
+        "--learnable_lambdas_level",
+        type=int,
+        default=1,
+        help="porting all lambdalevel configurations back to the first trainer and net! 0=off, 1=mlp&interblock, 2=&xattn, 3=&sattn, 4=&resnets",
+    )
+    parser.add_argument(
         "--norm_salvation",
         action="store_true",
         default=None,
@@ -1257,6 +1304,12 @@ def setup_parser() -> argparse.ArgumentParser:
         type=float,
         default=None,
         help="interpolation term between clamped and nonclamped layernorm biases. pick something between 0.01 and 0.9.",
+    )
+    parser.add_argument(
+        "--layernorm_simple",
+        action="store_true",
+        default=None,
+        help="turn a layernorm into a layernorm-simple from https://arxiv.org/pdf/1911.07013, (making layernorm a gradient conditioner).",
     )
     parser.add_argument(
         "--pytorch_pinned_dataloader",

@@ -347,6 +347,7 @@ class ResnetBlock2D(nn.Module):
         self,
         in_channels,
         out_channels,
+        learnable_lambdas=0,
     ):
         super().__init__()
         self.in_channels = in_channels
@@ -373,8 +374,17 @@ class ResnetBlock2D(nn.Module):
             self.skip_connection = nn.Identity()
 
         self.gradient_checkpointing = False
-        #if self.learnedlambda1 is None:
-        #    self.learnedlambda1 = nn.Parameter(torch.tensor(0.5))
+        self.learnable_lambdas = learnable_lambdas
+        self.learnedlambda1 = nn.Parameter(torch.tensor(1.0))
+        self.deactivate_lambdagrad()
+        self.activate_lambdagrad(self.learnable_lambdas) #defaults to zero and off!
+
+    def deactivate_lambdagrad(self):
+        self.learnedlambda1.requires_grad_(False)
+
+    def activate_lambdagrad(self, lamlevel):
+        if lamlevel>=4:
+            self.learnedlambda1.requires_grad_(True)
 
     def forward_body(self, x, emb):
         h = self.in_layers(x)
@@ -382,7 +392,7 @@ class ResnetBlock2D(nn.Module):
         h = h + emb_out[:, :, None, None]
         h = self.out_layers(h)
         x = self.skip_connection(x)
-        return x + h
+        return self.learnedlambda1*x + h
 
     def forward(self, x, emb):
         if self.training and self.gradient_checkpointing:
@@ -803,7 +813,7 @@ class FeedForward(nn.Module):
 
 class BasicTransformerBlock(nn.Module):
     def __init__(
-        self, dim: int, num_attention_heads: int, attention_head_dim: int, cross_attention_dim: int, upcast_attention: bool = False
+        self, dim: int, num_attention_heads: int, attention_head_dim: int, cross_attention_dim: int, upcast_attention: bool = False, learnable_lambdas = 1
     ):
         super().__init__()
 
@@ -812,8 +822,13 @@ class BasicTransformerBlock(nn.Module):
         #UH OH LOOK OUT IT'S THE FAL-AI IMPLEMENTATION OF A LEARNABLE LAMBDA AWOOGA AWOOGA {MEL BLANC NOISES}.
         #actually the fal-AI implementation is really bad idk why they're putting two lambda terms in there.
         #seriously why two i do not understand.
-        self.learnedlambda1 = nn.Parameter(torch.tensor(0.5))
-        #self.learnedlambda2 = nn.Parameter(torch.tensor(0.5))
+        self.learnable_lambdas = learnable_lambdas
+        self.learnedlambda1 = nn.Parameter(torch.tensor(1.0))  #MLP skipweight
+        self.learnedlambda2 = nn.Parameter(torch.tensor(1.0))  #x-attn
+        self.learnedlambda3 = nn.Parameter(torch.tensor(1.0))  #s-attn
+
+        self.deactivate_lambdagrad()
+        self.activate_lambdagrad(self.learnable_lambdas)
 
         # 1. Self-Attn
         self.attn1 = CrossAttention(
@@ -840,6 +855,21 @@ class BasicTransformerBlock(nn.Module):
         # 3. Feed-forward
         self.norm3 = nn.LayerNorm(dim)
 
+    #helper methods to spear through the object oriented huggingface-sweplebeian 
+    #-unterpatrician-wrapperobfuscator-pipeliner code in outer repositories.
+    def deactivate_lambdagrad(self):
+        self.learnedlambda1.requires_grad_(False)
+        self.learnedlambda2.requires_grad_(False)
+        self.learnedlambda3.requires_grad_(False)
+
+    def activate_lambdagrad(self, lamlevel):
+        if lamlevel>=1:
+            self.learnedlambda1.requires_grad_(True)
+        if lamlevel>=2:
+            self.learnedlambda2.requires_grad_(True)
+        if lamlevel>=3:
+            self.learnedlambda3.requires_grad_(True)
+        
     def set_use_memory_efficient_attention(self, xformers: bool, mem_eff: bool):
         self.attn1.set_use_memory_efficient_attention(xformers, mem_eff)
         self.attn2.set_use_memory_efficient_attention(xformers, mem_eff)
@@ -869,11 +899,11 @@ class BasicTransformerBlock(nn.Module):
         # 1. Self-Attention
         norm_hidden_states = self.norm1(hidden_states)
 
-        hidden_states = self.attn1(norm_hidden_states) + hidden_states
+        hidden_states = self.attn1(norm_hidden_states) + self.learnedlambda3*hidden_states
 
         # 2. Cross-Attention
         norm_hidden_states = self.norm2(hidden_states)
-        hidden_states = self.attn2(norm_hidden_states, context=context) + hidden_states
+        hidden_states = self.attn2(norm_hidden_states, context=context) + self.learnedlambda2*hidden_states
 
         # 3. Feed-forward
         #hidden_states = self.ff(self.norm3(hidden_states)) + hidden_states
@@ -910,6 +940,7 @@ class Transformer2DModel(nn.Module):
         use_linear_projection: bool = False,
         upcast_attention: bool = False,
         num_transformer_layers: int = 1,
+        learnable_lambdas:int = 1
     ):
         super().__init__()
         self.in_channels = in_channels
@@ -920,7 +951,11 @@ class Transformer2DModel(nn.Module):
 
         self.norm = torch.nn.GroupNorm(num_groups=32, num_channels=in_channels, eps=1e-6, affine=True)
         # self.norm = GroupNorm32(32, in_channels, eps=1e-6, affine=True)
-        self.learnedlambda1 = nn.Parameter(torch.tensor(0.5))
+
+        self.learnable_lambdas = learnable_lambdas
+        self.learnedlambda1 = nn.Parameter(torch.tensor(1.0))
+        self.deactivate_lambdagrad()
+        self.activate_lambdagrad(learnable_lambdas)
 
         if use_linear_projection:
             self.proj_in = nn.Linear(in_channels, inner_dim)
@@ -936,6 +971,7 @@ class Transformer2DModel(nn.Module):
                     attention_head_dim,
                     cross_attention_dim=cross_attention_dim,
                     upcast_attention=upcast_attention,
+                    learnable_lambdas = learnable_lambdas
                 )
             )
 
@@ -947,6 +983,19 @@ class Transformer2DModel(nn.Module):
             self.proj_out = nn.Conv2d(inner_dim, in_channels, kernel_size=1, stride=1, padding=0)
 
         self.gradient_checkpointing = False
+
+    def deactivate_lambdagrad(self):
+        self.learnedlambda1.requires_grad_(False)
+
+    def activate_lambdagrad(self, lamlevel):
+        if lamlevel>=1:
+            self.learnedlambda1.requires_grad_(True)
+
+    def set_lambdagrad_hard_recurse(self, lamlevel):
+        #0 = off, (1,2,3) trigger (1,(1,2),(1,2,3))
+        for transformer in self.transformer_blocks:
+            transformer.deactivate_lambdagrad()
+            transformer.activate_lambdagrad(lamlevel)
 
     def set_use_memory_efficient_attention(self, xformers, mem_eff):
         for transformer in self.transformer_blocks:
@@ -1081,6 +1130,9 @@ class SdxlUNet2DConditionModel(nn.Module):
 
         self.gradient_checkpointing = False
         # self.sample_size = sample_size
+        self.learnable_lambdas = 0 #disable by default
+        if "learnable_lambdas_level" in kwargs.keys():
+            self.learnable_lambdas = kwargs["learnable_lambdas_level"]
 
         # time embedding
         self.time_embed = nn.Sequential(
@@ -1113,6 +1165,7 @@ class SdxlUNet2DConditionModel(nn.Module):
                 ResnetBlock2D(
                     in_channels=1 * self.model_channels,
                     out_channels=1 * self.model_channels,
+                    learnable_lambdas = self.learnable_lambdas
                 ),
             ]
             self.input_blocks.append(nn.ModuleList(layers))
@@ -1132,6 +1185,7 @@ class SdxlUNet2DConditionModel(nn.Module):
                 ResnetBlock2D(
                     in_channels=(1 if i == 0 else 2) * self.model_channels,
                     out_channels=2 * self.model_channels,
+                    learnable_lambdas = self.learnable_lambdas
                 ),
                 Transformer2DModel(
                     num_attention_heads=2 * self.model_channels // 64,
@@ -1140,6 +1194,7 @@ class SdxlUNet2DConditionModel(nn.Module):
                     num_transformer_layers=2,
                     use_linear_projection=True,
                     cross_attention_dim=2048,
+                    learnable_lambdas = self.learnable_lambdas
                 ),
             ]
             self.input_blocks.append(nn.ModuleList(layers))
@@ -1159,6 +1214,7 @@ class SdxlUNet2DConditionModel(nn.Module):
                 ResnetBlock2D(
                     in_channels=(2 if i == 0 else 4) * self.model_channels,
                     out_channels=4 * self.model_channels,
+                    learnable_lambdas = self.learnable_lambdas
                 ),
                 Transformer2DModel(
                     num_attention_heads=4 * self.model_channels // 64,
@@ -1167,6 +1223,7 @@ class SdxlUNet2DConditionModel(nn.Module):
                     num_transformer_layers=10,
                     use_linear_projection=True,
                     cross_attention_dim=2048,
+                    learnable_lambdas = self.learnable_lambdas
                 ),
             ]
             self.input_blocks.append(nn.ModuleList(layers))
@@ -1177,6 +1234,7 @@ class SdxlUNet2DConditionModel(nn.Module):
                 ResnetBlock2D(
                     in_channels=4 * self.model_channels,
                     out_channels=4 * self.model_channels,
+                    learnable_lambdas = self.learnable_lambdas
                 ),
                 Transformer2DModel(
                     num_attention_heads=4 * self.model_channels // 64,
@@ -1185,10 +1243,12 @@ class SdxlUNet2DConditionModel(nn.Module):
                     num_transformer_layers=10,
                     use_linear_projection=True,
                     cross_attention_dim=2048,
+                    learnable_lambdas = self.learnable_lambdas
                 ),
                 ResnetBlock2D(
                     in_channels=4 * self.model_channels,
                     out_channels=4 * self.model_channels,
+                    learnable_lambdas = self.learnable_lambdas
                 ),
             ]
         )
@@ -1202,6 +1262,7 @@ class SdxlUNet2DConditionModel(nn.Module):
                 ResnetBlock2D(
                     in_channels=4 * self.model_channels + (4 if i <= 1 else 2) * self.model_channels,
                     out_channels=4 * self.model_channels,
+                    learnable_lambdas = self.learnable_lambdas
                 ),
                 Transformer2DModel(
                     num_attention_heads=4 * self.model_channels // 64,
@@ -1210,6 +1271,7 @@ class SdxlUNet2DConditionModel(nn.Module):
                     num_transformer_layers=10,
                     use_linear_projection=True,
                     cross_attention_dim=2048,
+                    learnable_lambdas = self.learnable_lambdas
                 ),
             ]
             if i == 2:
@@ -1228,6 +1290,7 @@ class SdxlUNet2DConditionModel(nn.Module):
                 ResnetBlock2D(
                     in_channels=2 * self.model_channels + (4 if i == 0 else (2 if i == 1 else 1)) * self.model_channels,
                     out_channels=2 * self.model_channels,
+                    learnable_lambdas = self.learnable_lambdas
                 ),
                 Transformer2DModel(
                     num_attention_heads=2 * self.model_channels // 64,
@@ -1236,6 +1299,7 @@ class SdxlUNet2DConditionModel(nn.Module):
                     num_transformer_layers=2,
                     use_linear_projection=True,
                     cross_attention_dim=2048,
+                    learnable_lambdas = self.learnable_lambdas
                 ),
             ]
             if i == 2:
@@ -1254,6 +1318,7 @@ class SdxlUNet2DConditionModel(nn.Module):
                 ResnetBlock2D(
                     in_channels=1 * self.model_channels + (2 if i == 0 else 1) * self.model_channels,
                     out_channels=1 * self.model_channels,
+                    learnable_lambdas = self.learnable_lambdas
                 ),
             ]
 
@@ -1342,6 +1407,18 @@ class SdxlUNet2DConditionModel(nn.Module):
                 if hasattr(module, "gradient_checkpointing"):
                     # logger.info(f{module.__class__.__name__} {module.gradient_checkpointing} -> {value}")
                     module.gradient_checkpointing = value
+
+    def set_lambdagrad_hard_recurse(self, lamlevel):
+        #0 = off, (1,2,3) trigger (1,(1,2),(1,2,3))
+        blocks = self.input_blocks + [self.middle_block] + self.output_blocks
+        for block in blocks:
+            for module in block.modules():
+                if hasattr(module, "deactivate_lambdagrad"):
+                    module.deactivate_lambdagrad()
+                if hasattr(module, "activate_lambdagrad"):
+                    module.activate_lambdagrad(lamlevel)
+                if hasattr(module, "set_lambdagrad_hard_recurse"):
+                    module.set_lambdagrad_hard_recurse(lamlevel)
                     
 
     # endregion

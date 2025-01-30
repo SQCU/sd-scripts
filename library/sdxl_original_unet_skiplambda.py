@@ -773,9 +773,10 @@ class GEGLU(nn.Module):
         dim_out (`int`): The number of channels in the output.
     """
 
-    def __init__(self, dim_in: int, dim_out: int):
+    def __init__(self, dim_in: int, dim_out: int, swiglu_switcharoo = False):
         super().__init__()
         self.proj = nn.Linear(dim_in, dim_out * 2)
+        self.swiglu_switcharoo=swiglu_switcharoo
 
     def gelu(self, gate):
         if gate.device.type != "mps":
@@ -786,20 +787,38 @@ class GEGLU(nn.Module):
 
     def forward(self, hidden_states):
         hidden_states, gate = self.proj(hidden_states).chunk(2, dim=-1)
-        return hidden_states * self.gelu(gate)
+        if self.swiglu_switcharoo: 
+            return hidden_states * nn.functional.silu(gate)
+        else:
+            return hidden_states * self.gelu(gate)
+
+#might make networks incompatible. i cry every time.
+class SDXL_inplace_SWIGLU(nn.Module):
+    def __init__(self, dim_in: int, dim_out: int):
+        super().__init__()
+        self.proj = nn.Linear(dim_in, dim_out * 2)
+        #create the two chunkies for self use!
+
+    def forward(self, x):
+        x, gate = self.proj(x).chunk(2, dim=-1)
+        return x * nn.functional.silu(gate)
+        #it's swiglu!
 
 
 class FeedForward(nn.Module):
     def __init__(
         self,
         dim: int,
+        swiglu_switcharoo=False
     ):
         super().__init__()
         inner_dim = int(dim * 4)  # mult is always 4
+        #you know. so we can reuse existing projection weights but use swiglu instead with as few edits as possible.
+        self.swiglu_switcharoo=swiglu_switcharoo
 
         self.net = nn.ModuleList([])
         # project in
-        self.net.append(GEGLU(dim, inner_dim))
+        self.net.append(GEGLU(dim, inner_dim, swiglu_switcharoo=self.swiglu_switcharoo))
         # project dropout
         self.net.append(nn.Identity())  # nn.Dropout(0)) # dummy for dropout with 0
         # project out
@@ -813,7 +832,7 @@ class FeedForward(nn.Module):
 
 class BasicTransformerBlock(nn.Module):
     def __init__(
-        self, dim: int, num_attention_heads: int, attention_head_dim: int, cross_attention_dim: int, upcast_attention: bool = False, learnable_lambdas = 1
+        self, dim: int, num_attention_heads: int, attention_head_dim: int, cross_attention_dim: int, upcast_attention: bool = False, learnable_lambdas = 1, swiglu_switcharoo = False
     ):
         super().__init__()
 
@@ -830,6 +849,8 @@ class BasicTransformerBlock(nn.Module):
         self.deactivate_lambdagrad()
         self.activate_lambdagrad(self.learnable_lambdas)
 
+        self.swiglu_switcharoo=swiglu_switcharoo
+
         # 1. Self-Attn
         self.attn1 = CrossAttention(
             query_dim=dim,
@@ -838,7 +859,7 @@ class BasicTransformerBlock(nn.Module):
             dim_head=attention_head_dim,
             upcast_attention=upcast_attention,
         )
-        self.ff = FeedForward(dim)
+        self.ff = FeedForward(dim, swiglu_switcharoo=self.swiglu_switcharoo)
 
         # 2. Cross-Attn
         self.attn2 = CrossAttention(
@@ -940,7 +961,8 @@ class Transformer2DModel(nn.Module):
         use_linear_projection: bool = False,
         upcast_attention: bool = False,
         num_transformer_layers: int = 1,
-        learnable_lambdas:int = 1
+        learnable_lambdas:int = 1,
+        swiglu_switcharoo:bool = False
     ):
         super().__init__()
         self.in_channels = in_channels
@@ -957,6 +979,8 @@ class Transformer2DModel(nn.Module):
         self.deactivate_lambdagrad()
         self.activate_lambdagrad(learnable_lambdas)
 
+        self.swiglu_switcharoo=swiglu_switcharoo
+
         if use_linear_projection:
             self.proj_in = nn.Linear(in_channels, inner_dim)
         else:
@@ -971,7 +995,8 @@ class Transformer2DModel(nn.Module):
                     attention_head_dim,
                     cross_attention_dim=cross_attention_dim,
                     upcast_attention=upcast_attention,
-                    learnable_lambdas = learnable_lambdas
+                    learnable_lambdas = learnable_lambdas,
+                    swiglu_switcharoo=self.swiglu_switcharoo
                 )
             )
 
@@ -1134,6 +1159,11 @@ class SdxlUNet2DConditionModel(nn.Module):
         if "learnable_lambdas_level" in kwargs.keys():
             self.learnable_lambdas = kwargs["learnable_lambdas_level"]
 
+        if "swiglu_switcharoo" in kwargs.keys():
+            self.swiglu_switcharoo=kwargs["swiglu_switcharoo"]
+        else:
+            self.swiglu_switcharoo = False
+
         # time embedding
         self.time_embed = nn.Sequential(
             nn.Linear(self.model_channels, self.time_embed_dim),
@@ -1194,7 +1224,8 @@ class SdxlUNet2DConditionModel(nn.Module):
                     num_transformer_layers=2,
                     use_linear_projection=True,
                     cross_attention_dim=2048,
-                    learnable_lambdas = self.learnable_lambdas
+                    learnable_lambdas = self.learnable_lambdas,
+                    swiglu_switcharoo=self.swiglu_switcharoo
                 ),
             ]
             self.input_blocks.append(nn.ModuleList(layers))
@@ -1223,7 +1254,8 @@ class SdxlUNet2DConditionModel(nn.Module):
                     num_transformer_layers=10,
                     use_linear_projection=True,
                     cross_attention_dim=2048,
-                    learnable_lambdas = self.learnable_lambdas
+                    learnable_lambdas = self.learnable_lambdas,
+                    swiglu_switcharoo=self.swiglu_switcharoo
                 ),
             ]
             self.input_blocks.append(nn.ModuleList(layers))
@@ -1243,7 +1275,8 @@ class SdxlUNet2DConditionModel(nn.Module):
                     num_transformer_layers=10,
                     use_linear_projection=True,
                     cross_attention_dim=2048,
-                    learnable_lambdas = self.learnable_lambdas
+                    learnable_lambdas = self.learnable_lambdas,
+                    swiglu_switcharoo=self.swiglu_switcharoo
                 ),
                 ResnetBlock2D(
                     in_channels=4 * self.model_channels,
@@ -1271,7 +1304,8 @@ class SdxlUNet2DConditionModel(nn.Module):
                     num_transformer_layers=10,
                     use_linear_projection=True,
                     cross_attention_dim=2048,
-                    learnable_lambdas = self.learnable_lambdas
+                    learnable_lambdas = self.learnable_lambdas,
+                    swiglu_switcharoo=self.swiglu_switcharoo
                 ),
             ]
             if i == 2:
@@ -1299,7 +1333,8 @@ class SdxlUNet2DConditionModel(nn.Module):
                     num_transformer_layers=2,
                     use_linear_projection=True,
                     cross_attention_dim=2048,
-                    learnable_lambdas = self.learnable_lambdas
+                    learnable_lambdas = self.learnable_lambdas,
+                    swiglu_switcharoo=self.swiglu_switcharoo
                 ),
             ]
             if i == 2:

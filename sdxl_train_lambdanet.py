@@ -315,6 +315,7 @@ def train(args):
     # add keys to initdict{} here to pipe configuration to model init
     initdict={}
     initdict.update({"learnable_lambdas_level":args.learnable_lambdas_level})
+    initdict.update({"swiglu_switcharoo":args.swiglu_switcharoo})
     (
         load_stable_diffusion_format,
         text_encoder1,
@@ -472,8 +473,19 @@ def train(args):
         clippables = list(clippables)
     else:
         clippables = clippables_beta
-    if args.bias_abolisher:
-        biasfilter = ('norm1', 'norm2', 'norm3')
+    if args.outblock_bias_abolisher:
+        prefix = 'output_blocks.'
+        modulefilter = ('norm1', 'norm2', 'norm3')
+        for name, param in unet.named_parameters():
+            for mod in modulefilter:
+                if mod in name:
+                    if prefix in name and 'bias' in name:
+                        affinenormbiases.append(name)
+            if args.groupnorm_bias_abolisher_auxiliary:
+                if prefix in name and 'GroupNorm' in name:
+                    if 'bias' in name:
+                            affinenormbiases.append(name)
+    elif args.bias_abolisher:
         for name, param in unet.named_parameters():
             if 'norm1' in name or 'norm2' in name or 'norm3' in name and 'model.diffusion_model' in name:
                 if 'bias' in name:
@@ -592,7 +604,8 @@ def train(args):
             logger.info(f"using {norms_kv} overrides to optimizer config.")
         
         lskip_kv ={"weight_decay":0}
-
+        if args.ll_lr:
+            lskip_kv.update({"lr":args.ll_lr})
         optimizer.mng.override_config(parameters=skipweight_params, key_value_dict=lskip_kv)
         logger.info(f"using {lskip_kv} overrides to skipweight optimizer config.")
 
@@ -1257,6 +1270,18 @@ def setup_parser() -> argparse.ArgumentParser:
         help="porting all lambdalevel configurations back to the first trainer and net! 0=off, 1=mlp&interblock, 2=&xattn, 3=&sattn, 4=&resnets",
     )
     parser.add_argument(
+        "--ll_lr",
+        type=float,
+        default=None,
+        help="pass 1 learned lambda lr vlues.",
+    )
+    parser.add_argument(
+        "--swiglu_switcharoo",
+        action="store_true",
+        default=False,
+        help="what if our network was a swiglunet instead of a geglunet? switch this to True to find out!",
+    )
+    parser.add_argument(
         "--norm_salvation",
         action="store_true",
         default=None,
@@ -1292,6 +1317,12 @@ def setup_parser() -> argparse.ArgumentParser:
         action="store_true",
         default=None,
         help="get rid of layernorm biases.",
+    )
+    parser.add_argument(
+        "--outblock_bias_abolisher",
+        action="store_true",
+        default=None,
+        help="get rid of layernorm biases but only in the out blocks.",
     )
     parser.add_argument(
         "--groupnorm_bias_abolisher_auxiliary",

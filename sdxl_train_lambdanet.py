@@ -36,6 +36,7 @@ import library.config_util as config_util
 #import library.sdxl_train_util as sdxl_train_util
 import library.sdxl_train_util_lambdanet as sdxl_train_util
 
+
 from library.config_util import (
     ConfigSanitizer,
     BlueprintGenerator,
@@ -327,6 +328,30 @@ def train(args):
     ) = sdxl_train_util.load_target_model(args, accelerator, "sdxl", weight_dtype, initdict=initdict)
     # logit_scale = logit_scale.to(accelerator.device, dtype=weight_dtype)
 
+    if args.auxiliary_TE_loss_anthropic_style_baybee:
+        import copy
+        #oh yeah we need this haha
+        if args.auxiliary_TE_from_path is not None:
+            quasi_args = copy.deepcopy(args) #don't trust the snake here
+            #the sd-scripts imports are serpentine but here's what they do:
+            #take args.pretrained_model_name_or_path from sdxl_train_util.load_target_model(...)
+            #use that to pick the path for all further path requiring actions.
+            #
+            # here we overwrite a copy of the args with the path of the sdxl model we're using for a KL divergence measure
+            quasi_args.pretrained_model_name_or_path = args.auxiliary_TE_from_path
+            ( shim_format, auxiliary_text_encoder1, auxiliary_text_encoder2, shim_vae, shim_unet, shim_logit_scale, shim_ckpt_info, 
+            ) = sdxl_train_util.load_target_model(args, accelerator, "sdxl", weight_dtype, initdict=initdict)
+            del shim_format, shim_vae, shim_unet, shim_logit_scale, shim_ckpt_info
+        elif args.auxiliary_TE_from_same: #i do not recommend this yet it should be offered 
+            auxiliary_text_encoder1 = copy.deepcopy(text_encoder1)
+            auxiliary_text_encoder2 = copy.deepcopy(text_encoder2)
+        else:
+            accelerator.print("critical show-stopping configuration error. do not use auxiliary TE loss without examining source more closely.")
+        auxiliary_text_encoder1.requires_grad_(False)
+        auxiliary_text_encoder2.requires_grad_(False)
+        auxiliary_text_encoder1.eval()
+        auxiliary_text_encoder2.eval()
+
     # verify load/save model formats
     if load_stable_diffusion_format:
         src_stable_diffusion_ckpt = args.pretrained_model_name_or_path
@@ -443,6 +468,8 @@ def train(args):
                     accelerator.is_main_process,
                 )
             accelerator.wait_for_everyone()
+
+
 
     if not cache_latents:
         vae.requires_grad_(False)
@@ -693,6 +720,11 @@ def train(args):
         text_encoder1.text_model.encoder.layers[-1].requires_grad_(False)
         text_encoder1.text_model.final_layer_norm.requires_grad_(False)
 
+    #same for TE2!
+    if train_text_encoder2:
+        text_encoder2.text_model.encoder.layers[-1].requires_grad_(False)
+        text_encoder2.text_model.final_layer_norm.requires_grad_(False)
+
     if args.deepspeed:
         ds_model = deepspeed_utils.prepare_deepspeed_model(
             args,
@@ -717,6 +749,18 @@ def train(args):
         if train_text_encoder2:
             text_encoder2 = accelerator.prepare(text_encoder2)
         optimizer, train_dataloader, lr_scheduler = accelerator.prepare(optimizer, train_dataloader, lr_scheduler)
+        if args.auxiliary_TE_loss_anthropic_style_baybee:
+            if train_text_encoder1:
+                auxiliary_text_encoder1.to(weight_dtype)
+                auxiliary_text_encoder1 = accelerator.prepare(auxiliary_text_encoder1)
+                training_models.append(auxiliary_text_encoder1)
+                auxiliary_text_encoder1.to(accelerator.device)
+            if train_text_encoder2:
+                auxiliary_text_encoder2.to(weight_dtype)
+                auxiliary_text_encoder2 = accelerator.prepare(auxiliary_text_encoder2)
+                training_models.append(auxiliary_text_encoder2)
+                auxiliary_text_encoder2.to(accelerator.device)
+             
 
     # TextEncoderの出力をキャッシュするときにはCPUへ移動する
     if args.cache_text_encoder_outputs:
@@ -858,6 +902,7 @@ def train(args):
     )
 
     loss_recorder = train_util.LossRecorder()
+    aux_loss_recorder = train_util.LossRecorder()
     for epoch in range(num_train_epochs):
         accelerator.print(f"\nepoch {epoch+1}/{num_train_epochs}")
         current_epoch.value = epoch + 1
@@ -884,11 +929,13 @@ def train(args):
                             accelerator.print("NaN found in latents, replacing with zeros")
                             latents = torch.nan_to_num(latents, 0, out=latents)
                 latents = latents * sdxl_model_util_lambdanet.VAE_SCALE_FACTOR
+                aux_loss = 0
 
+                #this is when youre using the text encoders in live fire mode
                 if "text_encoder_outputs1_list" not in batch or batch["text_encoder_outputs1_list"] is None:
                     input_ids1 = batch["input_ids"]
                     input_ids2 = batch["input_ids2"]
-                    with torch.set_grad_enabled(args.train_text_encoder):
+                    with torch.set_grad_enabled(args.train_text_encoder):   #fussy way of 
                         # Get the text embedding for conditioning
                         # TODO support weighted captions
                         # if args.weighted_captions:
@@ -915,7 +962,29 @@ def train(args):
                             None if not args.full_fp16 else weight_dtype,
                             accelerator=accelerator,
                         )
-                else:
+                    if args.auxiliary_TE_loss_anthropic_style_baybee:
+                        au_h_args = [args.max_token_length,
+                            input_ids1,
+                            input_ids2,
+                            tokenizer1,
+                            tokenizer2,
+                            text_encoder1,
+                            text_encoder2,
+                            None if not args.full_fp16 else weight_dtype,
+                            ]
+                        au_h_kwargs = {"accelerator":accelerator}
+                        if train_text_encoder1:
+                            au_h_args[-3]=auxiliary_text_encoder1
+                        if train_text_encoder2:
+                            au_h_args[-2]=auxiliary_text_encoder2
+
+                        auxiliary_encoder_hidden_states1, auxiliary_encoder_hidden_states2, shim_pool2 = train_util.get_hidden_states_sdxl(
+                            *au_h_args, **au_h_kwargs
+                        )
+                        del shim_pool2
+
+
+                else:   #this is when ur reusing cached TE embeddings
                     encoder_hidden_states1 = batch["text_encoder_outputs1_list"].to(accelerator.device).to(weight_dtype)
                     encoder_hidden_states2 = batch["text_encoder_outputs2_list"].to(accelerator.device).to(weight_dtype)
                     pool2 = batch["text_encoder_pool2_list"].to(accelerator.device).to(weight_dtype)
@@ -946,7 +1015,42 @@ def train(args):
                 # concat embeddings
                 vector_embedding = torch.cat([pool2, embs], dim=1).to(weight_dtype)
                 text_embedding = torch.cat([encoder_hidden_states1, encoder_hidden_states2], dim=2).to(weight_dtype)
+                if args.auxiliary_TE_loss_anthropic_style_baybee:
+                    #auxiliary_text_embedding = torch.cat([auxiliary_encoder_hidden_states1, auxiliary_encoder_hidden_states2], dim=2).to(weight_dtype)
 
+                    kloss = torch.nn.KLDivLoss(log_target= True, reduction = "batchmean")
+                    mseloss = torch.nn.MSELoss(reduction='none')
+                    te_aux_loss=0
+                    te_aux_loss1 = torch.zeros_like(encoder_hidden_states1)
+                    te_aux_loss2 = torch.zeros_like(encoder_hidden_states2)
+
+                    #haha
+                    #te_aux_loss = kloss(textembed_old, textembed_new)
+                    #te_aux_loss = kloss(encoder_hidden_states1.log(), auxiliary_encoder_hidden_states1.log())
+                    #te_aux_loss += kloss(encoder_hidden_states2.log(), auxiliary_encoder_hidden_states2.log())
+
+                    if train_text_encoder1:
+                        te_aux_loss1 = mseloss(encoder_hidden_states1,auxiliary_encoder_hidden_states1)
+                        if torch.any(torch.isnan(te_aux_loss1)):
+                            #rev1
+                            accelerator.print("NaN found in embedding comparison, replacing with zeros")
+                            #te_aux_loss1 = torch.nan_to_num(te_aux_loss1, nan=0, posinf=0, neginf=0)
+                            #rev2
+                            te_aux_loss1 = torch.zeros_like(encoder_hidden_states1)
+                        te_aux_loss1 = te_aux_loss1.mean()
+                        te_aux_loss += te_aux_loss1
+                    if train_text_encoder2:
+                        te_aux_loss2 = mseloss(encoder_hidden_states2,auxiliary_encoder_hidden_states2)
+                        if torch.any(torch.isnan(te_aux_loss2)):
+                            #rev1
+                            accelerator.print("NaN found in embedding comparison, replacing with zeros")
+                            #te_aux_loss2 = torch.nan_to_num(te_aux_loss2, nan=0, posinf=0, neginf=0)
+                            #rev2
+                            te_aux_loss2 = torch.zeros_like(encoder_hidden_states2)
+                        te_aux_loss2 = te_aux_loss2.mean()
+                        te_aux_loss += te_aux_loss2
+                    
+ 
                 # Sample noise, sample a random timestep for each image, and add noise to the latents,
                 # with noise offset and/or multires noise if specified
                 noise, noisy_latents, timesteps, huber_c = train_util.get_noise_noisy_latents_and_timesteps(
@@ -960,7 +1064,7 @@ def train(args):
                     noisy_latents = noisy_latents / noise_comp[timesteps].reshape(-1, 1, 1, 1)
 
                 # Predict the noise residual
-                z_list = torch.tensor(0.)
+                #z_list = torch.tensor(0.)
                 with accelerator.autocast():
                     noise_pred = unet(noisy_latents, timesteps, text_embedding, vector_embedding, ) #auxcum=z_list
 
@@ -1037,7 +1141,9 @@ def train(args):
                     #mtl_backward(losses=losses, features=features, aggregator=aggregator)
                     backward(loss, aggregator)
                 else:
-                    accelerator.backward(loss) #+z_list
+                    aux_loss = te_aux_loss*args.te_aux_loss_scale
+                    
+                    accelerator.backward(loss+aux_loss) #+z_list
                 
 
                 if not (args.fused_backward_pass or args.fused_optimizer_groups):
@@ -1118,8 +1224,11 @@ def train(args):
                             accelerator.print(f"onsave weightminmax:{bias_yoinkems(unet=unet,affinenormbiases=affinenormweights)}")
 
             current_loss = loss.detach().item()  # 平均なのでbatch sizeは関係ないはず
+            aux_current_loss = aux_loss.detach().item()
             if args.logging_dir is not None:
                 logs = {"loss": current_loss}
+                if args.auxiliary_TE_loss_anthropic_style_baybee:
+                    logs["aux_loss"] = aux_current_loss
                 if block_lrs is None:
                     train_util.append_lr_to_logs(logs, lr_scheduler, args.optimizer_type, including_unet=train_unet)
                 else:
@@ -1130,6 +1239,10 @@ def train(args):
             loss_recorder.add(epoch=epoch, step=step, loss=current_loss)
             avr_loss: float = loss_recorder.moving_average
             logs = {"avr_loss": avr_loss}  # , "lr": lr_scheduler.get_last_lr()[0]}
+            if args.auxiliary_TE_loss_anthropic_style_baybee:
+                aux_loss_recorder.add(epoch=epoch, step=step, loss=aux_current_loss)
+                aux_avr_loss: float = aux_loss_recorder.moving_average
+                logs["aux_avr_loss"] = aux_avr_loss
             progress_bar.set_postfix(**logs)
 
             if global_step >= args.max_train_steps:
@@ -1137,6 +1250,8 @@ def train(args):
 
         if args.logging_dir is not None:
             logs = {"loss/epoch": loss_recorder.moving_average}
+            if args.auxiliary_TE_loss_anthropic_style_baybee:
+                logs["aux_loss/epoch"] = aux_loss_recorder.moving_average
             accelerator.log(logs, step=epoch + 1)
 
         accelerator.wait_for_everyone()
@@ -1377,6 +1492,33 @@ def setup_parser() -> argparse.ArgumentParser:
         action="store_true",
         default=None,
         help="multiple gradient loss",
+    )
+    parser.add_argument(
+        "--auxiliary_TE_loss_anthropic_style_baybee",
+        action="store_true",
+        default=None,
+        help="""amend TE training with a MSE distance between snapshotted text encoder hidden states and present text encoder hidden states.
+        total memory hog; training both te1 and te2 is likely not possible in a consumer system.
+        several model loading doohickies have been implemented to reduce memory consumption for training either te1 *or* te2.
+        this method is brutally unstable, no checkpoints have ever been trained with a --learning_rate_te2 greater than 1e-07.""",
+    )
+    parser.add_argument(
+        "--auxiliary_TE_from_path",
+        type=str,
+        default=None,
+        help="path to reference checkpoint for text encoder aux loss",
+    )
+    parser.add_argument(
+        "--auxiliary_TE_from_same",
+        action="store_true",
+        default=None,
+        help="snapshot own pretrained model's checkpoints, not recommended unless you're confident you won't lose the checkpoint",
+    )
+    parser.add_argument(
+        "--te_aux_loss_scale",
+        type=float,
+        default=1e-3,
+        help="scale of auxiliary loss relative to base loss. 1e-3 recommended starting value.",
     )
     return parser
 

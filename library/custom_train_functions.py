@@ -196,6 +196,12 @@ def add_custom_train_arguments(parser: argparse.ArgumentParser, support_weighted
         help="what if we made things... a little... bigger. pick a target sqrt(width*height) to scale schedules towards.",
     )
     parser.add_argument(
+        "--sigmultiple_dozendrive",
+        action="store_true",
+        default=None,
+        help="extension of sigmaximum_overdrive to multiple resolution scale training.",
+    )
+    parser.add_argument(
         "--sigmoid_k_weighting",
         type=float,
         default=None,

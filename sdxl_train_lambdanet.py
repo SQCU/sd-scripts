@@ -1016,6 +1016,7 @@ def train(args):
                 # concat embeddings
                 vector_embedding = torch.cat([pool2, embs], dim=1).to(weight_dtype)
                 text_embedding = torch.cat([encoder_hidden_states1, encoder_hidden_states2], dim=2).to(weight_dtype)
+                #collect auxiliary loss against reference text encoder
                 if args.auxiliary_TE_loss_anthropic_style_baybee:
                     #auxiliary_text_embedding = torch.cat([auxiliary_encoder_hidden_states1, auxiliary_encoder_hidden_states2], dim=2).to(weight_dtype)
 
@@ -1050,13 +1051,45 @@ def train(args):
                             te_aux_loss2 = torch.zeros_like(encoder_hidden_states2)
                         te_aux_loss2 = te_aux_loss2.mean()
                         te_aux_loss += te_aux_loss2
+                
+                #sigmultiple_dozendrive
+                #what's in a LTRB?
+                #return crop_left, crop_top, crop_right, crop_bottom
+                #re l#1515 train_util.py:
+                #target_sizes_hw.append((int(target_size[1]), int(target_size[0])))
+                #ergo:
+                if args.sigmultiple_dozendrive:
+                    b, dims = target_size.shape[0], target_size.shape[1]
+                    unit_target_size = (target_size[0][1]*target_size[0][0])**0.5
+                    #sigmaximum is calibrated for 1024 base train resolution btw.
+                    if args.sigmaximum_overdrive is not None:
+                        sigmax_scale = args.sigmaximum_overdrive/1024
+                    else:
+                        sigmax_scale = 1/4 #default case of... normal sdxl noise schedule, i think, since 1024/4=256 => (256/256)**0.5 => 1.0
+
+                    sigmax_target = (unit_target_size*sigmax_scale/256)**0.5
                     
+                    #we shall presume resolution is invariant along a batch, might not be true under gradient accumulation or at all!
+                    sigmultiple_noise_scheduler = DDPMScheduler(
+                        beta_start=0.00085, 
+                        beta_end=(0.012*sigmax_target),
+                        beta_schedule=args.beta_schedule, num_train_timesteps=1000, clip_sample=False
+                    )
+
+
  
                 # Sample noise, sample a random timestep for each image, and add noise to the latents,
                 # with noise offset and/or multires noise if specified
-                noise, noisy_latents, timesteps, huber_c = train_util.get_noise_noisy_latents_and_timesteps(
-                    args, noise_scheduler, latents
-                )
+                # for sigmultiple, you would want to do something even more different if we had multiple resolution scales per batch...
+                # and i think we don't?
+                if args.sigmultiple_dozendrive:
+                    noise, noisy_latents, timesteps, huber_c = train_util.get_noise_noisy_latents_and_timesteps(
+                        args, noise_scheduler, latents
+                    )
+                else:
+                    noise, noisy_latents, timesteps, huber_c = train_util.get_noise_noisy_latents_and_timesteps(
+                        args, sigmultiple_noise_scheduler, latents
+                    )
 
                 noisy_latents = noisy_latents.to(weight_dtype)  # TODO check why noisy_latents is not weight_dtype
 

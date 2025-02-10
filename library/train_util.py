@@ -1023,6 +1023,9 @@ class BaseDataset(torch.utils.data.Dataset):
             f"bucket_reso_steps is {self.bucket_reso_steps}. it must be divisible by {min_steps}.\n"
             + f"bucket_reso_stepsが{self.bucket_reso_steps}です。{min_steps}で割り切れる必要があります"
         )
+    #multiresolution
+    def get_resolutions(self) -> List[Tuple[int, int]]:
+        return [(dataset.width, dataset.height) for dataset in self.datasets]
 
     def is_latent_cacheable(self):
         return all([not subset.color_aug and not subset.random_crop for subset in self.subsets])
@@ -1113,9 +1116,29 @@ class BaseDataset(torch.utils.data.Dataset):
         image_infos.sort(key=lambda info: info.bucket_reso[0] * info.bucket_reso[1])
 
         # split by resolution
-        batches = []
-        batch = []
+        # split by resolution and some conditions
+        class Condition:
+            def __init__(self, reso, flip_aug, alpha_mask, random_crop):
+                self.reso = reso
+                self.flip_aug = flip_aug
+                self.alpha_mask = alpha_mask
+                self.random_crop = random_crop
+
+            def __eq__(self, other):
+                return (
+                    self.reso == other.reso
+                    and self.flip_aug == other.flip_aug
+                    and self.alpha_mask == other.alpha_mask
+                    and self.random_crop == other.random_crop
+                )
+
+        batches : List[Tuple[Condition, List[ImageInfo]]] = []
+        batch : List[ImageInfo] = []
+        current_condition = None
+
         logger.info("checking cache validity...")
+        
+        
         for info in tqdm(image_infos):
             subset = self.image_to_subset[info.image_key]
 
@@ -1124,7 +1147,7 @@ class BaseDataset(torch.utils.data.Dataset):
 
             # check disk cache exists and size of latents
             if cache_to_disk:
-                info.latents_npz = os.path.splitext(info.absolute_path)[0] + file_suffix
+                info.latents_npz = os.path.splitext(info.absolute_path)[0] + f"_{info.image_size[0]:04d}x{info.image_size[1]:04d}" + file_suffix
                 if not is_main_process:  # store to info only
                     continue
 
@@ -1136,27 +1159,38 @@ class BaseDataset(torch.utils.data.Dataset):
                     continue
 
             # if last member of batch has different resolution, flush the batch
+            """
             if len(batch) > 0 and batch[-1].bucket_reso != info.bucket_reso:
-                batches.append(batch)
+                batches.append((current_condition, batch))
                 batch = []
+            """
+            
+            # if batch is not empty and condition is changed, flush the batch. Note that current_condition is not None if batch is not empty
+            condition = Condition(info.bucket_reso, subset.flip_aug, subset.alpha_mask, subset.random_crop)
+            if len(batch) > 0 and current_condition != condition:
+                batches.append((current_condition, batch))
+                batch = []
+                
 
             batch.append(info)
+            current_condition = condition
 
             # if number of data in batch is enough, flush the batch
             if len(batch) >= vae_batch_size:
-                batches.append(batch)
+                batches.append((current_condition, batch))
                 batch = []
+                current_condition 
 
         if len(batch) > 0:
-            batches.append(batch)
+            batches.append((current_condition, batch))
 
         if cache_to_disk and not is_main_process:  # if cache to disk, don't cache latents in non-main process, set to info only
             return
 
         # iterate batches: batch doesn't have image, image will be loaded in cache_batch_latents and discarded
         logger.info("caching latents...")
-        for batch in tqdm(batches, smoothing=1, total=len(batches)):
-            cache_batch_latents(vae, cache_to_disk, batch, subset.flip_aug, subset.alpha_mask, subset.random_crop)
+        for condition, batch in tqdm(batches, smoothing=1, total=len(batches)):
+            cache_batch_latents(vae, cache_to_disk, batch, condition.flip_aug, condition.alpha_mask, condition.random_crop)
 
     # if weight_dtype is specified, Text Encoder itself and output will be converted to the dtype
     # this method is only for SDXL, but it should be implemented here because it needs to be a method of dataset
@@ -1394,7 +1428,7 @@ class BaseDataset(torch.utils.data.Dataset):
 
                 image = None
             elif image_info.latents_npz is not None:  # FineTuningDatasetまたはcache_latents_to_disk=Trueの場合
-                latents, original_size, crop_ltrb, flipped_latents, alpha_mask = load_latents_from_disk(image_info.latents_npz)
+                latents, original_size, crop_ltrb, flipped_latents, alpha_mask = load_latents_from_disk(image_info.latents_npz, image_info.bucket_reso)
                 if flipped:
                     latents = flipped_latents
                     alpha_mask = None if alpha_mask is None else alpha_mask[:, ::-1].copy()  # copy to avoid negative stride problem
@@ -2423,32 +2457,51 @@ def is_disk_cached_latents_is_expected(reso, npz_path: str, flip_aug: bool, alph
 
 
 # 戻り値は、latents_tensor, (original_size width, original_size height), (crop left, crop top)
+#expected_latents_size = (reso[1] // 8, reso[0] // 8)  # bucket_resoはWxHなので注意
 def load_latents_from_disk(
-    npz_path,
+    npz_path: str, bucket_reso: Tuple[int,int], latents_stride:int = 8
 ) -> Tuple[Optional[np.ndarray], Optional[List[int]], Optional[List[int]], Optional[np.ndarray], Optional[np.ndarray]]:
-    npz = np.load(npz_path)
-    if "latents" not in npz:
-        raise ValueError(f"error: npz is old format. please re-generate {npz_path}")
+    latents_size = (bucket_reso[1] // latents_stride, bucket_reso[0] // latents_stride)
+    key_reso_suffix = f"_{latents_size[0]}x{latents_size[1]}"
 
-    latents = npz["latents"]
-    original_size = npz["original_size"].tolist()
-    crop_ltrb = npz["crop_ltrb"].tolist()
-    flipped_latents = npz["latents_flipped"] if "latents_flipped" in npz else None
-    alpha_mask = npz["alpha_mask"] if "alpha_mask" in npz else None
+    npz = np.load(npz_path)
+    #if "latents" not in npz:
+    #    raise ValueError(f"error: npz is old format. please re-generate {npz_path}")
+
+    if "latents" + key_reso_suffix not in npz:
+            raise ValueError(f"latents{key_reso_suffix} not found in {npz_path}")
+
+    #latents = npz["latents"]
+    #original_size = npz["original_size"].tolist()
+    #crop_ltrb = npz["crop_ltrb"].tolist()
+    #flipped_latents = npz["latents_flipped"] if "latents_flipped" in npz else None
+    #alpha_mask = npz["alpha_mask"] if "alpha_mask" in npz else None
+    latents = npz["latents" + key_reso_suffix]
+    original_size = npz["original_size" + key_reso_suffix].tolist()
+    crop_ltrb = npz["crop_ltrb" + key_reso_suffix].tolist()
+    flipped_latents = npz["latents_flipped" + key_reso_suffix] if "latents_flipped" + key_reso_suffix in npz else None
+    alpha_mask = npz["alpha_mask" + key_reso_suffix] if "alpha_mask" + key_reso_suffix in npz else None
     return latents, original_size, crop_ltrb, flipped_latents, alpha_mask
 
 
-def save_latents_to_disk(npz_path, latents_tensor, original_size, crop_ltrb, flipped_latents_tensor=None, alpha_mask=None):
+def save_latents_to_disk(npz_path, latents_tensor, original_size, crop_ltrb, flipped_latents_tensor=None, alpha_mask=None, key_reso_suffix=""):
     kwargs = {}
+
+    if os.path.exists(npz_path):
+        # load existing npz and update it
+        npz = np.load(npz_path)
+        for key in npz.files:
+            kwargs[key] = npz[key]
+
     if flipped_latents_tensor is not None:
-        kwargs["latents_flipped"] = flipped_latents_tensor.float().cpu().numpy()
+        kwargs["latents_flipped"+ key_reso_suffix] = flipped_latents_tensor.float().cpu().numpy()
     if alpha_mask is not None:
-        kwargs["alpha_mask"] = alpha_mask.float().cpu().numpy()
+        kwargs["alpha_mask"+ key_reso_suffix] = alpha_mask.float().cpu().numpy()
+    kwargs["latents" + key_reso_suffix] = latents_tensor.float().cpu().numpy()
+    kwargs["original_size" + key_reso_suffix] = np.array(original_size)
+    kwargs["crop_ltrb" + key_reso_suffix] = np.array(crop_ltrb)
     np.savez(
         npz_path,
-        latents=latents_tensor.float().cpu().numpy(),
-        original_size=np.array(original_size),
-        crop_ltrb=np.array(crop_ltrb),
         **kwargs,
     )
 
@@ -2730,7 +2783,7 @@ def load_images_and_masks_for_caching(
 
 
 def cache_batch_latents(
-    vae: AutoencoderKL, cache_to_disk: bool, image_infos: List[ImageInfo], flip_aug: bool, use_alpha_mask: bool, random_crop: bool
+    vae: AutoencoderKL, cache_to_disk: bool, image_infos: List[ImageInfo], flip_aug: bool, use_alpha_mask: bool, random_crop: bool, latents_stride:int = 8,
 ) -> None:
     r"""
     requires image_infos to have: absolute_path, bucket_reso, resized_size, latents_npz
@@ -2784,6 +2837,14 @@ def cache_batch_latents(
         if torch.isnan(latents).any() or (flipped_latent is not None and torch.isnan(flipped_latent).any()):
             raise RuntimeError(f"NaN detected in latents: {info.absolute_path}")
 
+        #multiple resolution training compatibility
+        #latents_size = latents.shape[1:3]  # H, W
+        #key_reso_suffix = f"_{latents_size[0]}x{latents_size[1]}" # e.g. "_32x64", HxW
+
+        #just checking...
+        latents_size = (info.bucket_reso[1] // latents_stride, info.bucket_reso[0] // latents_stride)
+        key_reso_suffix = f"_{latents_size[0]}x{latents_size[1]}"
+
         if cache_to_disk:
             save_latents_to_disk(
                 info.latents_npz,
@@ -2792,6 +2853,7 @@ def cache_batch_latents(
                 info.latents_crop_ltrb,
                 flipped_latent,
                 alpha_mask,
+                key_reso_suffix=key_reso_suffix 
             )
         else:
             info.latents = latent

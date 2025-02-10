@@ -569,7 +569,9 @@ def generate_dataset_group_by_blueprint(dataset_group_blueprint: DatasetGroupBlu
                     "    ",
                 )
 
-    logger.info(f"{info}")
+    #logger.info(f"{info}")
+    #add a verbosity flag for this, becomes unusable in a hurry.
+    logger.info(f"set {i} okay")
 
     # make buckets first because it determines the length of dataset
     # and set the same seed for all datasets

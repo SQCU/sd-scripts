@@ -275,6 +275,7 @@ def train(args):
         blueprint = blueprint_generator.generate(user_config, args, tokenizer=[tokenizer1, tokenizer2])
         train_dataset_group = config_util.generate_dataset_group_by_blueprint(blueprint.dataset_group)
     else:
+        logger.info("Training with arbitrary dataset.")
         train_dataset_group = train_util.load_arbitrary_dataset(args, [tokenizer1, tokenizer2])
 
     current_epoch = Value("i", 0)

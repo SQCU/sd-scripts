@@ -1164,7 +1164,7 @@ class BaseDataset(torch.utils.data.Dataset):
                 batches.append((current_condition, batch))
                 batch = []
             """
-            
+
             # if batch is not empty and condition is changed, flush the batch. Note that current_condition is not None if batch is not empty
             condition = Condition(info.bucket_reso, subset.flip_aug, subset.alpha_mask, subset.random_crop)
             if len(batch) > 0 and current_condition != condition:
@@ -2422,33 +2422,56 @@ class DatasetGroup(torch.utils.data.ConcatDataset):
             dataset.disable_token_padding()
 
 
-def is_disk_cached_latents_is_expected(reso, npz_path: str, flip_aug: bool, alpha_mask: bool):
-    expected_latents_size = (reso[1] // 8, reso[0] // 8)  # bucket_resoはWxHなので注意
-
+def is_disk_cached_latents_is_expected(reso, npz_path: str, flip_aug: bool, alpha_mask: bool, 
+    latents_stride:int = 8):
+    #old
+    #expected_latents_size = (reso[1] // 8, reso[0] // 8)  # bucket_resoはWxHなので注意
+    #better
+    expected_latents_size = (reso[1] // latents_stride, reso[0] // latents_stride)
+    key_reso_suffix = f"_{expected_latents_size[0]}x{expected_latents_size[1]}"
+    #logger.info(key_reso_suffix)
     if not os.path.exists(npz_path):
         return False
 
     try:
         npz = np.load(npz_path)
-        if "latents" not in npz or "original_size" not in npz or "crop_ltrb" not in npz:  # old ver?
-            return False
-        if npz["latents"].shape[1:3] != expected_latents_size:
-            return False
+        if "latents" + key_reso_suffix not in npz:  #singleres legacy support ig
+            if "latents" not in npz or "original_size" not in npz or "crop_ltrb" not in npz:  # old ver?
+                return False
+            if npz["latents"].shape[1:3] != expected_latents_size:
+                return False
 
+            if flip_aug:
+                if "latents_flipped" not in npz:
+                    return False
+                if npz["latents_flipped"].shape[1:3] != expected_latents_size:
+                    return False
+
+            if alpha_mask:
+                if "alpha_mask" not in npz:
+                    return False
+                if npz["alpha_mask"].shape[0:2] != reso:  # HxW
+                    return False
+            else:
+                if "alpha_mask" in npz:
+                    return False
+        if "latents" + key_reso_suffix not in npz or "original_size" + key_reso_suffix not in npz or "crop_ltrb" + key_reso_suffix not in npz:  # old ver?
+            return False
+        
+        if npz["latents" + key_reso_suffix].shape[1:3] != expected_latents_size:
+            return False
         if flip_aug:
-            if "latents_flipped" not in npz:
+            if "latents_flipped" + key_reso_suffix not in npz:
                 return False
-            if npz["latents_flipped"].shape[1:3] != expected_latents_size:
+            if npz["latents_flipped"+ key_reso_suffix].shape[1:3] != expected_latents_size:
                 return False
-
         if alpha_mask:
-            if "alpha_mask" not in npz:
+            if "alpha_mask"+ key_reso_suffix not in npz:
                 return False
-            if npz["alpha_mask"].shape[0:2] != reso:  # HxW
+            if npz["alpha_mask"+ key_reso_suffix].shape[0:2] != reso:  # HxW
                 return False
-        else:
-            if "alpha_mask" in npz:
-                return False
+        
+
     except Exception as e:
         logger.error(f"Error loading file: {npz_path}")
         raise e

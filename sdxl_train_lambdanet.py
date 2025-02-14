@@ -36,6 +36,8 @@ import library.config_util as config_util
 #import library.sdxl_train_util as sdxl_train_util
 import library.sdxl_train_util_lambdanet as sdxl_train_util
 
+import copy #deep deep copy
+
 
 from library.config_util import (
     ConfigSanitizer,
@@ -330,7 +332,6 @@ def train(args):
     # logit_scale = logit_scale.to(accelerator.device, dtype=weight_dtype)
 
     if args.auxiliary_TE_loss_anthropic_style_baybee:
-        import copy
         #oh yeah we need this haha
         if args.auxiliary_TE_from_path is not None:
             quasi_args = copy.deepcopy(args) #don't trust the snake here
@@ -869,17 +870,18 @@ def train(args):
     progress_bar = tqdm(range(args.max_train_steps), smoothing=0, disable=not accelerator.is_local_main_process, desc="steps")
     global_step = 0
 
+    betascale_kwargs={"num_train_timesteps":1000,"beta_start":0.00085,"beta_end":0.012,"beta_schedule":args.beta_schedule, "clip_sample":False}
+
     if args.sigmaximum_overdrive:
-        noise_scheduler = DDPMScheduler(
-            beta_start=0.00085, beta_end=(0.012*math.sqrt(args.sigmaximum_overdrive/256)), beta_schedule=args.beta_schedule, num_train_timesteps=1000, clip_sample=False
-        )
-        #beta_parameterization_keys = ("num_train_timesteps","beta_start","beta_end","beta_schedule")
-        betascale_kwargs={"num_train_timesteps":1000,"beta_start":0.00085,"beta_end":(0.012*math.sqrt(args.sigmaximum_overdrive/256)),"beta_schedule":args.beta_schedule}
-    else:    
-        noise_scheduler = DDPMScheduler(
-            beta_start=0.00085, beta_end=0.012, beta_schedule=args.beta_schedule, num_train_timesteps=1000, clip_sample=False
-        )
-        betascale_kwargs={}
+        betascale_kwargs["beta_end"]=0.012*((args.sigmaximum_overdrive/256)**0.5)
+
+    if args.sigminimum_overdrive:
+        betascale_kwargs["beta_start"]=0.00085*((args.sigminimum_overdrive/256)**0.5)
+
+    noise_scheduler = DDPMScheduler(
+    **betascale_kwargs
+    )
+
     prepare_scheduler_for_custom_training(noise_scheduler, accelerator.device)
     if args.zero_terminal_snr:
         custom_train_functions.fix_noise_scheduler_betas_for_zero_terminal_snr(noise_scheduler)
@@ -930,7 +932,7 @@ def train(args):
                             accelerator.print("NaN found in latents, replacing with zeros")
                             latents = torch.nan_to_num(latents, 0, out=latents)
                 latents = latents * sdxl_model_util_lambdanet.VAE_SCALE_FACTOR
-                aux_loss = 0
+                aux_loss = torch.tensor(0)
 
                 #this is when youre using the text encoders in live fire mode
                 if "text_encoder_outputs1_list" not in batch or batch["text_encoder_outputs1_list"] is None:
@@ -1059,21 +1061,30 @@ def train(args):
                 #target_sizes_hw.append((int(target_size[1]), int(target_size[0])))
                 #ergo:
                 if args.sigmultiple_dozendrive:
+                    smd_betascale_kwargs = copy.deepcopy(betascale_kwargs)
                     b, dims = target_size.shape[0], target_size.shape[1]
-                    unit_target_size = (target_size[0][1]*target_size[0][0])**0.5
+                    unit_target_size = (target_size[0][1]*target_size[0][0])**0.5   #grab the first size along the batch dim :)
                     #sigmaximum is calibrated for 1024 base train resolution btw.
                     if args.sigmaximum_overdrive is not None:
                         sigmax_scale = args.sigmaximum_overdrive/1024
                     else:
                         sigmax_scale = 1/4 #default case of... normal sdxl noise schedule, i think, since 1024/4=256 => (256/256)**0.5 => 1.0
 
+
+                    if args.sigminimum_overdrive is not None:
+                        sigmin_scale = args.sigminimum_overdrive/1024
+                    else:
+                        sigmin_scale = 1/4
+
                     sigmax_target = (unit_target_size*sigmax_scale/256)**0.5
+                    sigmin_target = (unit_target_size*sigmin_scale/256)**0.5
+
+                    smd_betascale_kwargs["beta_start"]=0.00085*sigmin_target
+                    smd_betascale_kwargs["beta_end"]=0.012*sigmax_target
                     
                     #we shall presume resolution is invariant along a batch, might not be true under gradient accumulation or at all!
                     sigmultiple_noise_scheduler = DDPMScheduler(
-                        beta_start=0.00085, 
-                        beta_end=(0.012*sigmax_target),
-                        beta_schedule=args.beta_schedule, num_train_timesteps=1000, clip_sample=False
+                        **smd_betascale_kwargs
                     )
 
 
@@ -1138,6 +1149,8 @@ def train(args):
                     #e.g. bc the timestep parameter only varies along batch dimension?
                     #this should already work fine with huber and smoothed loss. not sure why this wasn't in place forever ago.
 
+                    if args.eased_weighted_loss is not None:
+                        eikhon_loss = copy.deepcopy(loss)
 
                     if args.nullify_implicit_v_lossweight:  #unlike other loss weights this is a mix and match. go wild!
                         loss = nullify_implicit_v_lossweight(loss, timesteps, noise_scheduler, v_prediction=args.v_parameterization)
@@ -1163,6 +1176,13 @@ def train(args):
                         #batchsize = loss.size(0) # get batch 
                         #losses = loss.chunk(chunks=batchsize, dim=0)
                     else:
+                        if args.eased_weighted_loss is not None:
+                            clamps = tuple(args.eased_weighted_loss)
+                            coeffs = eikhon_loss/loss   #ratio
+                            coeffs = torch.log(coeffs)  #logspace
+                            coeffs = coeffs.clamp(coeffs, min=clamps[0], max=clamps[1]) #clamp
+                            loss   = eikhon_loss*torch.exp(coeffs)  #unlogspace
+                            del eikhon_loss, coeffs
                         loss = loss.mean()  # mean over batch dimension
                 else:
                     loss = train_util.conditional_loss(
@@ -1175,7 +1195,8 @@ def train(args):
                     #mtl_backward(losses=losses, features=features, aggregator=aggregator)
                     backward(loss, aggregator)
                 else:
-                    aux_loss = te_aux_loss*args.te_aux_loss_scale
+                    if args.auxiliary_TE_loss_anthropic_style_baybee:
+                        aux_loss = te_aux_loss*args.te_aux_loss_scale
                     
                     accelerator.backward(loss+aux_loss) #+z_list
                 
@@ -1553,6 +1574,13 @@ def setup_parser() -> argparse.ArgumentParser:
         type=float,
         default=1e-3,
         help="scale of auxiliary loss relative to base loss. 1e-3 recommended starting value.",
+    )
+    parser.add_argument(
+        "--eased_weighted_loss",
+        type=float,
+        nargs=2,
+        default=None,
+        help="Clamp minimum,maximum scale of loss weighting in logspace e.g. (-23, 1) will allow a maximum *increase* in loss by e times.",
     )
     return parser
 

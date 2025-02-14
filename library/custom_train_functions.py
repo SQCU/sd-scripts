@@ -122,26 +122,21 @@ def apply_salimans_vpred_weighting(loss, timesteps, noise_scheduler, v_predictio
 
 def apply_sigmoid_k_weighting(loss, timesteps, noise_scheduler, v_prediction=False, k_const=2):
     snr = torch.stack([noise_scheduler.all_snr[t] for t in timesteps])
-    v_baseline_loss = torch.ones_like(snr)
-    #if v_prediction:   #super unstable
-    #    v_baseline_loss = torch.exp(-torch.log(snr)/2)
     sigmo_loss = torch.sigmoid(-torch.log(snr)+k_const).float().to(dtype=loss.dtype, device=loss.device)
-    #if v_prediction:    #an alternate reading?
-    #    nullify_implicit_v_lossweight(loss, timesteps, noise_scheduler, v_prediction)
-
-    loss = loss * (sigmo_loss / v_baseline_loss)
+    loss = loss * sigmo_loss
     return loss
 
+#were we doing the cosine schedule version the entire time? probably, actually.
 def nullify_implicit_v_lossweight(loss, timesteps, noise_scheduler, v_prediction=False):
     snr = torch.stack([noise_scheduler.all_snr[t] for t in timesteps])
-    v_baseline_loss = torch.exp(-torch.log(snr+1)/2)  #AAAAAA . t=0 *= 0.02, t=T *= 0.996 ?
+    v_baseline_loss = torch.exp(-torch.log(snr))+1
     #print(f"loss:{loss}\nv_baseline_loss_weight:{v_baseline_loss}")
     loss = loss * (v_baseline_loss.float().to(dtype=loss.dtype, device=loss.device) ** -1) # if we divided this, which is what vibed right at first, we are scaling in the same direction as snr weighting.
     return loss
 
 def slam_implicit_v_lossweight(loss, timesteps, noise_scheduler, v_prediction=False):
     snr = torch.stack([noise_scheduler.all_snr[t] for t in timesteps])
-    v_baseline_loss = torch.exp(-torch.log(snr)/2)  #AAAAAA . t=0 *= 0.02, t=T *= 0.996 ?
+    v_baseline_loss = torch.exp(-torch.log(snr))+1  #AAAAAA . t=0 *= 0.02, t=T *= 0.996 ?
     loss = loss * v_baseline_loss.float().to(dtype=loss.dtype, device=loss.device) # lets multiply instead :)
     return loss
 
@@ -194,6 +189,12 @@ def add_custom_train_arguments(parser: argparse.ArgumentParser, support_weighted
         type=float,
         default=None,
         help="what if we made things... a little... bigger. pick a target sqrt(width*height) to scale schedules towards.",
+    )
+    parser.add_argument(
+        "--sigminimum_overdrive",
+        type=float,
+        default=None,
+        help="what if we made things... grow a little... faster. pick a target sqrt(width*height) to scale schedule origins towards.",
     )
     parser.add_argument(
         "--sigmultiple_dozendrive",

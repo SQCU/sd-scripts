@@ -1,4 +1,5 @@
 import torch
+from torch.nn import functional as F
 import argparse
 import random
 import re
@@ -13,8 +14,9 @@ logger = logging.getLogger(__name__)
 
 
 def prepare_scheduler_for_custom_training(noise_scheduler, device):
-    if hasattr(noise_scheduler, "all_snr"):
-        return
+    #if hasattr(noise_scheduler, "all_snr") and hasattr(noise_scheduler, "lambda_t"):
+    #    return
+    #why was this block even there
 
     alphas_cumprod = noise_scheduler.alphas_cumprod
     sqrt_alphas_cumprod = torch.sqrt(alphas_cumprod)
@@ -22,9 +24,83 @@ def prepare_scheduler_for_custom_training(noise_scheduler, device):
     alpha = sqrt_alphas_cumprod
     sigma = sqrt_one_minus_alphas_cumprod
     all_snr = (alpha / sigma) ** 2
+    lambda_t = torch.log(all_snr)
 
     noise_scheduler.all_snr = all_snr.to(device)
+    noise_scheduler.lambda_t = lambda_t.to(device)
 
+def recompile_scheduler_from_logspace(noise_scheduler, new_lambdas, ztsnr=False):
+    #λ(t) = log(a^2/σ^2)
+    #a**2 = sigmoid(λ(t))
+    #σ**2 = sigmoid(-λ(t)) 
+    #mappings
+    alpha2 = torch.sigmoid(new_lambdas)
+    sigma2 = torch.sigmoid(-new_lambdas)
+    all_snr = torch.exp(new_lambdas)
+    #sigma = sigma2**0.5
+
+    #reuse beta yoinkems from enforce_ztsnr
+    alphas = alpha2[1:]/alpha2[:-1]
+    alphas = torch.cat(alpha2[0:1],alphas)
+    betas = 1 - alphas
+
+    #write
+    noise_scheduler.betas = betas
+    noise_scheduler.alphas = alphas
+    noise_scheduler.alphas_cumprod = alpha2 #used by scheduling_ddpm
+    noise_scheduler.lambda_t = new_lambdas
+    if ztsnr:
+        fix_noise_scheduler_betas_for_zero_terminal_snr(noise_scheduler)
+    
+#https://arxiv.org/abs/2301.11093
+def logspace_shift_lambdas(noise_scheduler, shift:tuple):
+    #expect shift[0]=reference, shift[-1]=target
+    lambda_t = noise_scheduler.lambda_t.clone()
+    lambda_t = lambda_t + 2*torch.log(shift[0]/shift[-1])
+    return lambda_t
+
+#https://arxiv.org/abs/2301.11093
+def logspace_interp_lambdas(noise_scheduler, secondshift:tuple):
+    #expect shift[0]=reference_low, shift[1]=reference_high, shift[-1] = target
+    lambda_t = noise_scheduler.lambda_t.clone()
+    num_train_timesteps = noise_scheduler.num_train_timesteps.clone()
+    t_domain = torch.arange(0, num_train_timesteps)
+    shiftlow = logspace_shift_lambdas(noise_scheduler, shift=tuple(shift[0],shift[-1]))
+    shifthigh = logspace_shift_lambdas(noise_scheduler, shift=tuple(shift[1],shift[-1]))
+    for t in t_domain:
+        t_mapped = t/num_train_timesteps
+        lambda_t[t] = t_mapped * shifthigh[t] + (1-t_mapped) * shiftlow[t]
+    return lambda_t
+
+#also https://arxiv.org/abs/2301.11093
+def multisampling_multiscale_latents(lossfn, loss_kwargs, target, pred, downscale_factors:tuple , apply_masked_loss_flag:bool=False, batch=None):
+    #dtarget = []
+    #dpred = []
+    losses = []
+    #
+    #for downer in downscale_factors:
+        #concatenate along the batch dimension since these bad boys get mean reduced anyways
+        #dtarget.append(F.interpolate(target, scale_factor=downer))
+        #dpred.append(F.interpolate(pred, scale_factor=downer))
+    #reshaping tensors is pricey in headroom, try to do it exactly once
+    #target = torch.stack(dtarget, 0)
+    #pred = torch.stack(dpred, 0)
+    #del dtarget, dpred
+    for downer in downscale_factors:
+        dloss = lossfn(F.interpolate(pred, scale_factor=downer, mode='bilinear').float(), F.interpolate(target, scale_factor=downer, mode='bilinear').float())
+        
+        if apply_masked_loss_flag:
+            #dloss = apply_masked_loss(dloss, batch)
+            #todo: figure out how masked loss interacts with interpolate lol
+            logger.info("what exactly are you trying to pull off here with interpolated masked loss?")
+            break
+
+        #reduce along non-batch dimensions so we can tensor them lol
+        dloss = dloss.mean([1, 2, 3])
+        losses.append(dloss)
+    losses = torch.stack(losses)
+    losses.mean(0) #mean along downscale dim, we *want* this squeezed away.
+    return losses
 
 def fix_noise_scheduler_betas_for_zero_terminal_snr(noise_scheduler):
     # fix beta: zero terminal SNR
@@ -122,6 +198,7 @@ def apply_salimans_vpred_weighting(loss, timesteps, noise_scheduler, v_predictio
 
 def apply_sigmoid_k_weighting(loss, timesteps, noise_scheduler, v_prediction=False, k_const=2):
     snr = torch.stack([noise_scheduler.all_snr[t] for t in timesteps])
+    snr = torch.minimum(snr, torch.ones_like(snr) * 10000)
     sigmo_loss = torch.sigmoid(-torch.log(snr)+k_const).float().to(dtype=loss.dtype, device=loss.device)
     loss = loss * sigmo_loss
     return loss
@@ -129,6 +206,7 @@ def apply_sigmoid_k_weighting(loss, timesteps, noise_scheduler, v_prediction=Fal
 #were we doing the cosine schedule version the entire time? probably, actually.
 def nullify_implicit_v_lossweight(loss, timesteps, noise_scheduler, v_prediction=False):
     snr = torch.stack([noise_scheduler.all_snr[t] for t in timesteps])
+    snr = torch.minimum(snr, torch.ones_like(snr) * 10000)
     v_baseline_loss = torch.exp(-torch.log(snr))+1
     #print(f"loss:{loss}\nv_baseline_loss_weight:{v_baseline_loss}")
     loss = loss * (v_baseline_loss.float().to(dtype=loss.dtype, device=loss.device) ** -1) # if we divided this, which is what vibed right at first, we are scaling in the same direction as snr weighting.
@@ -136,6 +214,7 @@ def nullify_implicit_v_lossweight(loss, timesteps, noise_scheduler, v_prediction
 
 def slam_implicit_v_lossweight(loss, timesteps, noise_scheduler, v_prediction=False):
     snr = torch.stack([noise_scheduler.all_snr[t] for t in timesteps])
+    snr = torch.minimum(snr, torch.ones_like(snr) * 10000)
     v_baseline_loss = torch.exp(-torch.log(snr))+1  #AAAAAA . t=0 *= 0.02, t=T *= 0.996 ?
     loss = loss * v_baseline_loss.float().to(dtype=loss.dtype, device=loss.device) # lets multiply instead :)
     return loss
@@ -237,6 +316,32 @@ def add_custom_train_arguments(parser: argparse.ArgumentParser, support_weighted
         type=float,
         default=False,
         help="register hook to clamp gradient values e.g. during rather than after backprop",
+    )
+    parser.add_argument(
+        "--logscale_lambda_references",
+        type=float,
+        nargs=2,
+        default=None,
+        help="supply two reference resolutions, e.g. 64, 256",
+    )
+    parser.add_argument(
+        "--logscale_lambda_interp",
+        action="store_true",
+        default=None,
+        help="apply https://arxiv.org/abs/2301.11093 -styled interpolated logSNR schedules.",
+    )
+    parser.add_argument(
+        "--multiscale_latents_factors",
+        type=float,
+        nargs='+',
+        default=None,
+        help="multisampling latent loss scale factors",
+    )
+    parser.add_argument(
+        "--multisampling_multiscale_loss",
+        action="store_true",
+        default=None,
+        help="apply https://arxiv.org/abs/2301.11093 -styled multiscale loss. nonsensical without selecting at least 2-3 multiscale_latents_factors",
     )
     if support_weighted_captions:
         parser.add_argument(

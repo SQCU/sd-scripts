@@ -1086,6 +1086,9 @@ def train(args):
                     sigmultiple_noise_scheduler = DDPMScheduler(
                         **smd_betascale_kwargs
                     )
+                    prepare_scheduler_for_custom_training(sigmultiple_noise_scheduler, accelerator.device)
+                    if args.zero_terminal_snr:
+                        custom_train_functions.fix_noise_scheduler_betas_for_zero_terminal_snr(sigmultiple_noise_scheduler)
 
 
  
@@ -1095,11 +1098,11 @@ def train(args):
                 # and i think we don't?
                 if args.sigmultiple_dozendrive:
                     noise, noisy_latents, timesteps, huber_c = train_util.get_noise_noisy_latents_and_timesteps(
-                        args, noise_scheduler, latents
+                        args, sigmultiple_noise_scheduler, latents
                     )
                 else:
                     noise, noisy_latents, timesteps, huber_c = train_util.get_noise_noisy_latents_and_timesteps(
-                        args, sigmultiple_noise_scheduler, latents
+                        args, noise_scheduler, latents
                     )
 
                 noisy_latents = noisy_latents.to(weight_dtype)  # TODO check why noisy_latents is not weight_dtype
@@ -1119,7 +1122,7 @@ def train(args):
                     target = noise_scheduler.get_velocity(latents, noise, timesteps)
                 else:
                     target = noise
-
+                
                 if ( 
                     args.min_snr_gamma
                     or args.scale_v_pred_loss_like_noise_pred
@@ -1132,17 +1135,28 @@ def train(args):
                     or args.salimans_vpred_weighting
                     or args.sigmoid_k_weighting
                     or args.khrapov_et_al_scheduled_huber_coefficient   #this means that huber coefficient can be different within batches. invalidates batch mean reduction.
+                    or args.multisampling_multiscale_loss
                 ):
                     # do not mean over batch dimension for snr weight or scale v-pred loss
                     # why was this block hidden here?
-                    loss = train_util.conditional_loss(
-                        noise_pred.float(), target.float(), reduction="none", loss_type=args.loss_type, huber_c=huber_c, cumtoggle = True, args=args
-                    )
-                    if args.masked_loss or ("alpha_masks" in batch and batch["alpha_masks"] is not None):
+                    if args.multisampling_multiscale_loss and args.multiscale_latents_factors is not None:
+                        lossifier = train_util.conditional_loss
+                        loss_kwargs = {"reduction":"none", "loss_type":args.loss_type, "huber_c":huber_c, "cumtoggle":True, "args":args}
+                        loss = custom_train_functions.multisampling_multiscale_latents(
+                            lossfn=lossifier, loss_kwargs=loss_kwargs, target=target,pred=noise_pred,downscale_factors=args.multiscale_latents_factors, apply_masked_loss_flag = args.masked_loss, batch=batch)
+                    #caution: stacks the new resolution variants across a new axis.
+                    else:
+                        loss = train_util.conditional_loss(
+                            noise_pred.float(), target.float(), reduction="none", loss_type=args.loss_type, huber_c=huber_c, cumtoggle=True, args=args
+                        )
+                    if args.masked_loss or ("alpha_masks" in batch and batch["alpha_masks"] is not None) and not args.multisampling_multiscale_loss:
                         loss = apply_masked_loss(loss, batch)
                     if args.use_torchjd:
                         loss = loss
                         #don't mean for torchjd backward case?
+                    if args.multisampling_multiscale_loss:
+                        loss = loss#.mean([-3,-2,-1])
+                        #we had to mean somewhere else so the tensors could fit together
                     else:
                         loss = loss.mean([1, 2, 3]) #mean over non-batch dimensions
                     #but wait, does that even matter if the loss weighting is samplewise, 

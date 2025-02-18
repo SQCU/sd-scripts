@@ -76,6 +76,7 @@ from library.utils import setup_logging
 
 setup_logging()
 import logging
+import warnings
 
 logger = logging.getLogger(__name__)
 # from library.attention_processors import FlashAttnProcessor
@@ -1189,8 +1190,13 @@ class BaseDataset(torch.utils.data.Dataset):
 
         # iterate batches: batch doesn't have image, image will be loaded in cache_batch_latents and discarded
         logger.info("caching latents...")
-        for condition, batch in tqdm(batches, smoothing=1, total=len(batches)):
-            cache_batch_latents(vae, cache_to_disk, batch, condition.flip_aug, condition.alpha_mask, condition.random_crop)
+        with warnings.catch_warnings(record=True) as w:
+            for condition, batch in tqdm(batches, smoothing=1, total=len(batches)):
+                cache_batch_latents(vae, cache_to_disk, batch, condition.flip_aug, condition.alpha_mask, condition.random_crop)
+                if len(w) != 0:
+                    logger.info(f"caught warning {w[0]}")
+                    logger.info(f"{[batchlet.absolute_path for batchlet in batch]} potentially affected")
+        #except DecompressionBombWarning:
 
     # if weight_dtype is specified, Text Encoder itself and output will be converted to the dtype
     # this method is only for SDXL, but it should be implemented here because it needs to be a method of dataset
@@ -2499,6 +2505,7 @@ def load_latents_from_disk(
     #crop_ltrb = npz["crop_ltrb"].tolist()
     #flipped_latents = npz["latents_flipped"] if "latents_flipped" in npz else None
     #alpha_mask = npz["alpha_mask"] if "alpha_mask" in npz else None
+    #experimental bf16 latents
     latents = npz["latents" + key_reso_suffix]
     original_size = npz["original_size" + key_reso_suffix].tolist()
     crop_ltrb = npz["crop_ltrb" + key_reso_suffix].tolist()

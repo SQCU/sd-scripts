@@ -195,7 +195,7 @@ def _load_state_dict_on_device(model, state_dict, device, dtype=None):
 
 
 
-def load_models_from_sdxl_checkpoint(model_version, ckpt_path, map_location, dtype=None, disable_mmap=False, initdict={}):
+def load_models_from_sdxl_checkpoint(model_version, ckpt_path, map_location, dtype=None, disable_mmap=False, unet_ema_load=False, initdict={}):
     # model_version is reserved for future use
     # dtype is used for full_fp16/bf16 integration. Text Encoder will remain fp32, because it runs on CPU when caching
 
@@ -227,14 +227,35 @@ def load_models_from_sdxl_checkpoint(model_version, ckpt_path, map_location, dty
     logger.info("building U-Net")
     with init_empty_weights():
         unet = sdxl_original_unet_skiplambda.SdxlUNet2DConditionModel(**initdict)
+        if unet_ema_load:
+            unet_ema = sdxl_original_unet_skiplambda.SdxlUNet2DConditionModel(**initdict)
 
     logger.info("loading U-Net from checkpoint")
     unet_sd = {}
+    unet_ema_sd = {}
     for k in list(state_dict.keys()):
         if k.startswith("model.diffusion_model."):
             unet_sd[k.replace("model.diffusion_model.", "")] = state_dict.pop(k)
+    unet_length = len(unet_sd.keys())
+    if unet_ema_load:   #have to copy base unet before load_state_dict_on_device it seems
+        for k in list(state_dict.keys()):
+            if k.startswith("ema.model.diffusion_model."):
+                unet_ema_sd[k.replace("ema.model.diffusion_model.", "")] = state_dict.pop(k)
+        if len(unet_ema_sd.keys()) != unet_length:
+            logger.info(f"U-Net-EMA size mismatch: {len(unet_ema_sd.keys())} vs {unet_length}. Initializing from U-NET.")
+            try:
+                import copy
+                unet_ema_sd = copy.deepcopy(unet_sd)
+            except:
+                logger.info(f"somehow you couldn't even copy U-NET. wack.")
     info = _load_state_dict_on_device(unet, unet_sd, device=map_location, dtype=dtype)
     logger.info(f"U-Net: {info}")
+    
+    if unet_ema_load:  
+        ema_info = _load_state_dict_on_device(unet_ema, unet_ema_sd, device=map_location, dtype=dtype)
+        #unet_ema.requires_grad_(False)
+        logger.info(f"U-Net-EMA: {ema_info}")
+
 
     # Text Encoders
     logger.info("building text encoders")
@@ -322,6 +343,9 @@ def load_models_from_sdxl_checkpoint(model_version, ckpt_path, map_location, dty
     logger.info(f"VAE: {info}")
 
     ckpt_info = (epoch, global_step) if epoch is not None else None
+    if unet_ema_load:
+        return text_model1, text_model2, vae, unet, unet_ema, logit_scale, ckpt_info
+
     return text_model1, text_model2, vae, unet, logit_scale, ckpt_info
 
 
@@ -517,6 +541,7 @@ def save_stable_diffusion_checkpoint(
     logit_scale,
     metadata,
     save_dtype=None,
+    unet_ema=None,
 ):
     state_dict = {}
 
@@ -529,6 +554,10 @@ def save_stable_diffusion_checkpoint(
 
     # Convert the UNet model
     update_sd("model.diffusion_model.", unet.state_dict())
+
+    # Convert UNet Ema model:
+    if unet_ema is not None:
+        update_sd("ema.model.diffusion_model.", unet_ema.state_dict())
 
     # Convert the text encoders
     update_sd("conditioner.embedders.0.transformer.", text_encoder1.state_dict())
@@ -561,9 +590,12 @@ def save_stable_diffusion_checkpoint(
 
 
 def save_diffusers_checkpoint(
-    output_dir, text_encoder1, text_encoder2, unet, pretrained_model_name_or_path, vae=None, use_safetensors=False, save_dtype=None
+    output_dir, text_encoder1, text_encoder2, unet, pretrained_model_name_or_path, vae=None, use_safetensors=False, save_dtype=None, unet_ema=None
 ):
     from diffusers import StableDiffusionXLPipeline
+
+    if unet_ema is not None:
+        logger.info("wow bad news i mean uh there just doesn't seem to be any huggingface support for EMA weights funny that huh")
 
     # convert U-Net
     unet_sd = unet.state_dict()

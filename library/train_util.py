@@ -671,6 +671,7 @@ class BaseDataset(torch.utils.data.Dataset):
         self.bucket_reso_steps = None
         self.bucket_no_upscale = None
         self.bucket_info = None  # for metadata
+        self.opencv2_interpolation_mode = "INTER_AREA"
 
         self.tokenizer_max_length = self.tokenizers[0].model_max_length if max_token_length is None else max_token_length + 2
 
@@ -1340,6 +1341,21 @@ class BaseDataset(torch.utils.data.Dataset):
 
     # いい感じに切り出す
     def crop_target(self, subset: BaseSubset, image, face_cx, face_cy, face_w, face_h):
+        if self.opencv2_interpolation_mode is not None:
+            if self.opencv2_interpolation_mode == "INTER_AREA":
+                intermodo = cv2.INTER_AREA
+            if self.opencv2_interpolation_mode == "INTER_NEAREST":
+                intermodo = cv2.INTER_NEAREST_EXACT
+            if self.opencv2_interpolation_mode == "INTER_LINEAR":
+                intermodo = cv2.INTER_LINEAR
+            if self.opencv2_interpolation_mode == "INTER_LINEAR_EXACT":
+                intermodo = cv.INTER_LINEAR_EXACT
+            if self.opencv2_interpolation_mode == "INTER_CUBIC":
+                intermodo = cv2.INTER_CUBIC
+            if self.opencv2_interpolation_mode == "INTER_LANCZOS4":
+                intermodo = cv2.INTER_LANCZOS4
+        else:
+            intermodo = cv2.INTER_AREA #lame default you didn't pick one
         height, width = image.shape[0:2]
         if height == self.height and width == self.width:
             return image
@@ -1358,7 +1374,7 @@ class BaseDataset(torch.utils.data.Dataset):
         nh = int(height * scale + 0.5)
         nw = int(width * scale + 0.5)
         assert nh >= self.height and nw >= self.width, f"internal error. small scale {scale}, {width}*{height}"
-        image = cv2.resize(image, (nw, nh), interpolation=cv2.INTER_AREA)
+        image = cv2.resize(image, (nw, nh), interpolation=intermodo)
         face_cx = int(face_cx * scale + 0.5)
         face_cy = int(face_cy * scale + 0.5)
         height, width = nh, nw
@@ -3343,7 +3359,7 @@ def add_optimizer_arguments(parser: argparse.ArgumentParser):
         "--optimizer_type",
         type=str,
         default="",
-        help="Optimizer to use / オプティマイザの種類: AdamW (default), AdamW8bit, PagedAdamW, PagedAdamW8bit, PagedAdamW32bit, Lion8bit, PagedLion8bit, Lion, SGDNesterov, SGDNesterov8bit, DAdaptation(DAdaptAdamPreprint), DAdaptAdaGrad, DAdaptAdam, DAdaptAdan, DAdaptAdanIP, DAdaptLion, DAdaptSGD, AdaFactor",
+        help="Optimizer to use / オプティマイザの種類: AdamW (default), AdamW8bit, PagedAdamW, PagedAdamW8bit, PagedAdamW32bit, Lion8bit, PagedLion8bit, Lion, SGDNesterov, SGDNesterov8bit, DAdaptation(DAdaptAdamPreprint), DAdaptAdaGrad, DAdaptAdam, DAdaptAdan, DAdaptAdanIP, DAdaptLion, DAdaptSGD, AdaFactor, LAMB8bit",
     )
 
     # backward compatibility
@@ -4204,6 +4220,12 @@ def add_dataset_arguments(
         default=None,
         help="dataset class for arbitrary dataset (package.module.Class) / 任意のデータセットを用いるときのクラス名 (package.module.Class)",
     )
+    parser.add_argument(
+        "--opencv2_interpolation_mode",
+        type=str,
+        default=None,
+        help="swap image downscaling (and upscaling) algorithm with one of the supported opencv transforms. try INTER_LANCZOS4 or INTER_CUBIC!",
+    )
 
     if support_caption_dropout:
         # Textual Inversion はcaptionのdropoutをsupportしない
@@ -4502,6 +4524,15 @@ def get_optimizer(args, trainable_params):
             except AttributeError:
                 raise AttributeError(
                     "No PagedLion8bit. The version of bitsandbytes installed seems to be old. Please install 0.39.0 or later. / PagedLion8bitが定義されていません。インストールされているbitsandbytesのバージョンが古いようです。0.39.0以上をインストールしてください"
+                )
+        elif optimizer_type == "LAMB8bit".lower():
+            logger.info(f"use 8-bit LAMB optimizer | {optimizer_kwargs}")
+            try:
+                optimizer_class = bnb.optim.LAMB8bit
+                optimizer = optimizer_class(trainable_params, lr=lr, **optimizer_kwargs) 
+            except AttributeError:
+                raise AttributeError(
+                    "No LAMB8bit. The version of bitsandbytes installed seems to be wack. Please install 0.39.0 or later. / LAMB8bitが定義されていません。インストールされているbitsandbytesのバージョンが古いようです。0.39.0以上をインストールしてください"
                 )
 
         optimizer = optimizer_class(trainable_params, lr=lr, **optimizer_kwargs)
@@ -5461,7 +5492,7 @@ def get_timesteps_and_huber_c(args, min_timestep, max_timestep, noise_scheduler,
         #so for situations like these, we may want to create a torch.ones_like(tenny) or torch.zeros_like(tenny).
 
     timesteps = torch.randint(min_timestep, max_timestep, (b_size,), device=device) #stock implementation!
-    huber_coefficient = torch.ones_like(timesteps)
+    huber_coefficient = torch.ones_like(timesteps, device=device)
     timestep_domain = noise_scheduler.config.num_train_timesteps
     huber_epsilon = 1e-1
 
@@ -5506,7 +5537,7 @@ def get_timesteps_and_huber_c(args, min_timestep, max_timestep, noise_scheduler,
         for idx, t in enumerate(timesteps):
             huber_coefficient[idx] = hubsched_shiftsigsnr(t)
     else: #args.huber_schedule == "constant":
-        huber_coefficient = torch.tensor(hubsched_cnst(timesteps)).detach()
+        huber_coefficient = torch.tensor(hubsched_cnst(timesteps), device=device).detach()
         #now lets make it *really* constant so the batch splitting case in conditional_loss doesn't happen!
 
     timesteps = timesteps.long()

@@ -26,54 +26,59 @@ def prepare_scheduler_for_custom_training(noise_scheduler, device):
     all_snr = (alpha / sigma) ** 2
     lambda_t = torch.log(all_snr)
 
+    noise_scheduler.sigma = sigma.to(device)
     noise_scheduler.all_snr = all_snr.to(device)
     noise_scheduler.lambda_t = lambda_t.to(device)
 
-def recompile_scheduler_from_logspace(noise_scheduler, new_lambdas, ztsnr=False):
+def recompile_scheduler_from_logspace(noise_scheduler, new_lambdas, ztsnr=False, device="cpu"):
     #λ(t) = log(a^2/σ^2)
     #a**2 = sigmoid(λ(t))
     #σ**2 = sigmoid(-λ(t)) 
     #mappings
-    alpha2 = torch.sigmoid(new_lambdas)
-    sigma2 = torch.sigmoid(-new_lambdas)
+    #alpha2 = torch.sigmoid(new_lambdas)
     all_snr = torch.exp(new_lambdas)
-    #sigma = sigma2**0.5
+    sigma2 = torch.sigmoid(-new_lambdas)
+    alphas_cumprod = 1 / ((sigma2) + 1)
+    sigma = sigma2**0.5
 
     #reuse beta yoinkems from enforce_ztsnr
-    alphas = alpha2[1:]/alpha2[:-1]
-    alphas = torch.cat(alpha2[0:1],alphas)
+    #alphas = alpha2[1:]/alpha2[:-1]
+    #alphas = torch.cat([alpha2[0:1],alphas])
+    alphas = alphas_cumprod**0.5
     betas = 1 - alphas
 
     #write
-    noise_scheduler.betas = betas
-    noise_scheduler.alphas = alphas
-    noise_scheduler.alphas_cumprod = alpha2 #used by scheduling_ddpm
-    noise_scheduler.lambda_t = new_lambdas
+    noise_scheduler.betas = betas.to(device)
+    noise_scheduler.alphas = alphas.to(device)
+    noise_scheduler.sigma = sigma.to(device)
+    noise_scheduler.alphas_cumprod = alphas_cumprod.to(device) #used by scheduling_ddpm
+    noise_scheduler.lambda_t = new_lambdas.to(device)
+    prepare_scheduler_for_custom_training(noise_scheduler, device)
     if ztsnr:
         fix_noise_scheduler_betas_for_zero_terminal_snr(noise_scheduler)
     
 #https://arxiv.org/abs/2301.11093
 def logspace_shift_lambdas(noise_scheduler, shift:tuple):
     #expect shift[0]=reference, shift[-1]=target
-    lambda_t = noise_scheduler.lambda_t.clone()
+    lambda_t = noise_scheduler.lambda_t
     lambda_t = lambda_t + 2*torch.log(shift[0]/shift[-1])
     return lambda_t
 
 #https://arxiv.org/abs/2301.11093
 def logspace_interp_lambdas(noise_scheduler, secondshift:tuple):
     #expect shift[0]=reference_low, shift[1]=reference_high, shift[-1] = target
-    lambda_t = noise_scheduler.lambda_t.clone()
-    num_train_timesteps = noise_scheduler.num_train_timesteps.clone()
+    lambda_t = noise_scheduler.lambda_t
+    num_train_timesteps = noise_scheduler.num_train_timesteps
     t_domain = torch.arange(0, num_train_timesteps)
-    shiftlow = logspace_shift_lambdas(noise_scheduler, shift=tuple(shift[0],shift[-1]))
-    shifthigh = logspace_shift_lambdas(noise_scheduler, shift=tuple(shift[1],shift[-1]))
+    shiftlow = logspace_shift_lambdas(noise_scheduler, shift=(secondshift[0],secondshift[-1]))
+    shifthigh = logspace_shift_lambdas(noise_scheduler, shift=(secondshift[1],secondshift[-1]))
     for t in t_domain:
         t_mapped = t/num_train_timesteps
         lambda_t[t] = t_mapped * shifthigh[t] + (1-t_mapped) * shiftlow[t]
     return lambda_t
 
 #also https://arxiv.org/abs/2301.11093
-def multisampling_multiscale_latents(lossfn, loss_kwargs, target, pred, downscale_factors:tuple , apply_masked_loss_flag:bool=False, batch=None):
+def multisampling_multiscale_latents(lossfn, loss_kwargs, target, pred, downscale_factors:tuple , apply_masked_loss_flag:bool=False, batch=None, interpmode="bilinear"):
     #dtarget = []
     #dpred = []
     losses = []
@@ -86,8 +91,11 @@ def multisampling_multiscale_latents(lossfn, loss_kwargs, target, pred, downscal
     #target = torch.stack(dtarget, 0)
     #pred = torch.stack(dpred, 0)
     #del dtarget, dpred
-    for downer in downscale_factors:
-        dloss = lossfn(F.interpolate(pred, scale_factor=downer, mode='bilinear').float(), F.interpolate(target, scale_factor=downer, mode='bilinear').float())
+    for downer in downscale_factors:    #mode='bilinear' 
+        dloss = lossfn(
+            F.interpolate(pred, scale_factor=downer, mode=interpmode).float(),
+            F.interpolate(target, scale_factor=downer, mode=interpmode).float(), 
+            **loss_kwargs)
         
         if apply_masked_loss_flag:
             #dloss = apply_masked_loss(dloss, batch)
@@ -180,7 +188,7 @@ def apply_debiased_estimation(loss, timesteps, noise_scheduler, v_prediction=Fal
         weight = 1 / torch.sqrt(snr_t + 1)
     else:
         weight = 1 / torch.sqrt(snr_t)
-    loss = loss = weight * loss
+    loss = weight * loss
     return loss
 
 def apply_karras_edm_weighting(loss, timesteps, noise_scheduler):
@@ -198,15 +206,18 @@ def apply_salimans_vpred_weighting(loss, timesteps, noise_scheduler, v_predictio
 
 def apply_sigmoid_k_weighting(loss, timesteps, noise_scheduler, v_prediction=False, k_const=2):
     snr = torch.stack([noise_scheduler.all_snr[t] for t in timesteps])
-    snr = torch.minimum(snr, torch.ones_like(snr) * 10000)
+    snr = torch.minimum(snr, torch.ones_like(snr) * 1000)
+    if v_prediction:
+        snr = snr+1
     sigmo_loss = torch.sigmoid(-torch.log(snr)+k_const).float().to(dtype=loss.dtype, device=loss.device)
     loss = loss * sigmo_loss
     return loss
 
 #were we doing the cosine schedule version the entire time? probably, actually.
+#2303.00848 figure (53)
 def nullify_implicit_v_lossweight(loss, timesteps, noise_scheduler, v_prediction=False):
     snr = torch.stack([noise_scheduler.all_snr[t] for t in timesteps])
-    snr = torch.minimum(snr, torch.ones_like(snr) * 10000)
+    snr = torch.minimum(snr, torch.ones_like(snr) * 1000)
     v_baseline_loss = torch.exp(-torch.log(snr))+1
     #print(f"loss:{loss}\nv_baseline_loss_weight:{v_baseline_loss}")
     loss = loss * (v_baseline_loss.float().to(dtype=loss.dtype, device=loss.device) ** -1) # if we divided this, which is what vibed right at first, we are scaling in the same direction as snr weighting.
@@ -214,7 +225,7 @@ def nullify_implicit_v_lossweight(loss, timesteps, noise_scheduler, v_prediction
 
 def slam_implicit_v_lossweight(loss, timesteps, noise_scheduler, v_prediction=False):
     snr = torch.stack([noise_scheduler.all_snr[t] for t in timesteps])
-    snr = torch.minimum(snr, torch.ones_like(snr) * 10000)
+    snr = torch.minimum(snr, torch.ones_like(snr) * 1000)
     v_baseline_loss = torch.exp(-torch.log(snr))+1  #AAAAAA . t=0 *= 0.02, t=T *= 0.996 ?
     loss = loss * v_baseline_loss.float().to(dtype=loss.dtype, device=loss.device) # lets multiply instead :)
     return loss
@@ -342,6 +353,12 @@ def add_custom_train_arguments(parser: argparse.ArgumentParser, support_weighted
         action="store_true",
         default=None,
         help="apply https://arxiv.org/abs/2301.11093 -styled multiscale loss. nonsensical without selecting at least 2-3 multiscale_latents_factors",
+    )
+    parser.add_argument(
+        "--multisampling_multiscale_interpmode",
+        type=str,
+        default=None,
+        help="apply https://arxiv.org/abs/2301.11093 -styled multiscale loss. switch interpolation mode for target and prediction.",
     )
     if support_weighted_captions:
         parser.add_argument(

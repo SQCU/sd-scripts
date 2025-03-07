@@ -29,7 +29,7 @@ TOKENIZER2_PATH = "laion/CLIP-ViT-bigG-14-laion2B-39B-b160k"
 # DEFAULT_NOISE_OFFSET = 0.0357
 
 
-def load_target_model(args, accelerator, model_version: str, weight_dtype, initdict={}):
+def load_target_model(args, accelerator, model_version: str, weight_dtype, initdict={}, unet_ema_load=False):
     model_dtype = match_mixed_precision(args, weight_dtype)  # prepare fp16/bf16
     for pi in range(accelerator.state.num_processes):
         if pi == accelerator.state.local_process_index:
@@ -41,6 +41,7 @@ def load_target_model(args, accelerator, model_version: str, weight_dtype, initd
                 text_encoder2,
                 vae,
                 unet,
+                unet_ema,
                 logit_scale,
                 ckpt_info,
             ) = _load_target_model(
@@ -51,7 +52,8 @@ def load_target_model(args, accelerator, model_version: str, weight_dtype, initd
                 accelerator.device if args.lowram else "cpu",
                 model_dtype,
                 args.disable_mmap_load_safetensors,
-                initdict=initdict
+                initdict=initdict,
+                unet_ema_load=unet_ema_load
             )
 
             # work on low-ram device
@@ -63,27 +65,40 @@ def load_target_model(args, accelerator, model_version: str, weight_dtype, initd
 
             clean_memory_on_device(accelerator.device)
         accelerator.wait_for_everyone()
-
+    if unet_ema_load:
+        return load_stable_diffusion_format, text_encoder1, text_encoder2, vae, unet, unet_ema, logit_scale, ckpt_info
     return load_stable_diffusion_format, text_encoder1, text_encoder2, vae, unet, logit_scale, ckpt_info
 
 
 def _load_target_model(
-    name_or_path: str, vae_path: Optional[str], model_version: str, weight_dtype, device="cpu", model_dtype=None, disable_mmap=False, initdict={}
+    name_or_path: str, vae_path: Optional[str], model_version: str, weight_dtype, device="cpu", model_dtype=None, disable_mmap=False, initdict={}, unet_ema_load=False
 ):
     # model_dtype only work with full fp16/bf16
     name_or_path = os.readlink(name_or_path) if os.path.islink(name_or_path) else name_or_path
     load_stable_diffusion_format = os.path.isfile(name_or_path)  # determine SD or Diffusers
+    unet_ema = None
 
     if load_stable_diffusion_format:
         logger.info(f"load StableDiffusion checkpoint: {name_or_path}\ninitdict:{initdict}")
-        (
-            text_encoder1,
-            text_encoder2,
-            vae,
-            unet,
-            logit_scale,
-            ckpt_info,
-        ) = sdxl_model_util_lambdanet.load_models_from_sdxl_checkpoint(model_version, name_or_path, device, model_dtype, disable_mmap, initdict=initdict)
+        if unet_ema_load:
+            (
+                text_encoder1,
+                text_encoder2,
+                vae,
+                unet,
+                unet_ema,
+                logit_scale,
+                ckpt_info,
+            ) = sdxl_model_util_lambdanet.load_models_from_sdxl_checkpoint(model_version, name_or_path, device, model_dtype, disable_mmap, initdict=initdict, unet_ema_load=unet_ema_load)
+        else:
+            (
+                text_encoder1,
+                text_encoder2,
+                vae,
+                unet,
+                logit_scale,
+                ckpt_info,
+            ) = sdxl_model_util_lambdanet.load_models_from_sdxl_checkpoint(model_version, name_or_path, device, model_dtype, disable_mmap, initdict=initdict, unet_ema_load=unet_ema_load)
     else:
         # Diffusers model is loaded to CPU
         from diffusers import StableDiffusionXLPipeline
@@ -136,7 +151,7 @@ def _load_target_model(
         vae = model_util.load_vae(vae_path, weight_dtype)
         logger.info("additional VAE loaded")
 
-    return load_stable_diffusion_format, text_encoder1, text_encoder2, vae, unet, logit_scale, ckpt_info
+    return load_stable_diffusion_format, text_encoder1, text_encoder2, vae, unet, unet_ema, logit_scale, ckpt_info
 
 
 def load_tokenizers(args: argparse.Namespace):
@@ -236,6 +251,7 @@ def save_sd_model_on_train_end(
     vae,
     logit_scale,
     ckpt_info,
+    unet_ema=None,
 ):
     def sd_saver(ckpt_file, epoch_no, global_step):
         sai_metadata = train_util.get_sai_model_spec(None, args, True, False, False, is_stable_diffusion_ckpt=True)
@@ -251,6 +267,7 @@ def save_sd_model_on_train_end(
             logit_scale,
             sai_metadata,
             save_dtype,
+            unet_ema=unet_ema,
         )
 
     def diffusers_saver(out_dir):
@@ -263,6 +280,7 @@ def save_sd_model_on_train_end(
             vae,
             use_safetensors=use_safetensors,
             save_dtype=save_dtype,
+            unet_ema=unet_ema,
         )
 
     train_util.save_sd_model_on_train_end_common(
@@ -289,6 +307,7 @@ def save_sd_model_on_epoch_end_or_stepwise(
     vae,
     logit_scale,
     ckpt_info,
+    unet_ema=None
 ):
     def sd_saver(ckpt_file, epoch_no, global_step):
         sai_metadata = train_util.get_sai_model_spec(None, args, True, False, False, is_stable_diffusion_ckpt=True)
@@ -304,6 +323,7 @@ def save_sd_model_on_epoch_end_or_stepwise(
             logit_scale,
             sai_metadata,
             save_dtype,
+            unet_ema=unet_ema
         )
 
     def diffusers_saver(out_dir):

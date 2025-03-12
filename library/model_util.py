@@ -412,6 +412,11 @@ def convert_ldm_vae_checkpoint(checkpoint, config):
 
     new_checkpoint = {}
 
+    candidate_keys = ["encoder.conv_in.weight","encoder.conv_in.bias","encoder.conv_out.weight","encoder.conv_out.bias","encoder.conv_norm_out.weight","encoder.conv_norm_out.bias","decoder.conv_in.weight","decoder.conv_in.bias","decoder.conv_out.weight","decoder.conv_out.bias","decoder.conv_norm_out.weight","decoder.conv_norm_out.bias","quant_conv.weight","quant_conv.bias","post_quant_conv.weight","post_quant_conv.bias"]
+    
+    #new_checkpoint = {new_checkpoint[key] for key in candidate_keys if key in vae_state_dict.keys()}
+
+    
     new_checkpoint["encoder.conv_in.weight"] = vae_state_dict["encoder.conv_in.weight"]
     new_checkpoint["encoder.conv_in.bias"] = vae_state_dict["encoder.conv_in.bias"]
     new_checkpoint["encoder.conv_out.weight"] = vae_state_dict["encoder.conv_out.weight"]
@@ -430,6 +435,7 @@ def convert_ldm_vae_checkpoint(checkpoint, config):
     new_checkpoint["quant_conv.bias"] = vae_state_dict["quant_conv.bias"]
     new_checkpoint["post_quant_conv.weight"] = vae_state_dict["post_quant_conv.weight"]
     new_checkpoint["post_quant_conv.bias"] = vae_state_dict["post_quant_conv.bias"]
+    
 
     # Retrieves the keys for the encoder down blocks only
     num_down_blocks = len({".".join(layer.split(".")[:3]) for layer in vae_state_dict if "encoder.down" in layer})
@@ -546,12 +552,14 @@ def create_vae_diffusers_config():
     """
     Creates a config for the diffusers based on the config of the LDM model.
     """
-    # vae_params = original_config.model.params.first_stage_config.params.ddconfig
-    # _ = original_config.model.params.first_stage_config.params.embed_dim
+    #this was commented out for some reason
+    #vae_params = original_config.model.params.first_stage_config.params.ddconfig
+    #_ = original_config.model.params.first_stage_config.params.embed_dim
     block_out_channels = [VAE_PARAMS_CH * mult for mult in VAE_PARAMS_CH_MULT]
     down_block_types = ["DownEncoderBlock2D"] * len(block_out_channels)
     up_block_types = ["UpDecoderBlock2D"] * len(block_out_channels)
 
+    
     config = dict(
         sample_size=VAE_PARAMS_RESOLUTION,
         in_channels=VAE_PARAMS_IN_CHANNELS,
@@ -1264,7 +1272,7 @@ def save_diffusers_checkpoint(v2, output_dir, text_encoder, unet, pretrained_mod
 VAE_PREFIX = "first_stage_model."
 
 
-def load_vae(vae_id, dtype):
+def load_vae(vae_id, dtype):    #takes vae_path
     logger.info(f"load VAE: {vae_id}")
     if os.path.isdir(vae_id) or not os.path.isfile(vae_id):
         # Diffusers local/remote
@@ -1278,6 +1286,18 @@ def load_vae(vae_id, dtype):
 
     # local
     vae_config = create_vae_diffusers_config()
+
+    vaepathsplit, vae_ext = os.path.splitext(vae_id)
+    vaecfgpath = vaepathsplit+".json"
+    if os.path.exists(vaecfgpath):
+        print(vaecfgpath)
+        import json
+        #attempting to load vae config from file
+        with open(vaecfgpath) as data_file:
+            vaefilecfg = json.load(data_file)
+            vae_config.update(vaefilecfg)
+        vae = AutoencoderKL.from_pretrained(vae_id, **vae_config)
+        return vae
 
     if vae_id.endswith(".bin"):
         # SD 1.5 VAE on Huggingface

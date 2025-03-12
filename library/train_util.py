@@ -3353,7 +3353,6 @@ def add_sd_models_arguments(parser: argparse.ArgumentParser):
         help="directory for caching Tokenizer (for offline training) / Tokenizerをキャッシュするディレクトリ（ネット接続なしでの学習のため）",
     )
 
-
 def add_optimizer_arguments(parser: argparse.ArgumentParser):
     parser.add_argument(
         "--optimizer_type",

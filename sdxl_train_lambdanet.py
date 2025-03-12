@@ -146,7 +146,7 @@ def cleanup(unet:SdxlUNet2DConditionModel, affinenormbiases=[], affinenormweight
     usd = unet.state_dict()
     def continuous_abolisher(unet:SdxlUNet2DConditionModel, affinenormbiases=[], affinenormweights=[], incremental_abolish=None):
         for bias in affinenormbiases:
-            if incremental_abolish:
+            if incremental_abolish is not None and incremental_abolish[-1] < 1:
                 usd[str(bias)] = beta_clampy(usd[str(bias)], incremental_abolish[0], mink=0, maxk=2)
             else:
                 nonbeta_clampy(usd[str(bias)], mink=0, maxk=2)
@@ -155,17 +155,18 @@ def cleanup(unet:SdxlUNet2DConditionModel, affinenormbiases=[], affinenormweight
             wei = usd[str(weight)]
             weitarget = 1 #"""for a*gamma equals a nonoperation"""
             local_epsilon = 1e-08 # look... i...
-            if incremental_abolish:
+            if incremental_abolish is not None and incremental_abolish[-1] < 1:
                 #can't use unless inc_abolish exists!
-                inc_alpha = 1 - incremental_abolish[0] 
-                wei = beta_clampy(wei, incremental_abolish[0], mink=weitarget-inc_alpha, maxk=weitarget+inc_alpha)
+                inc_alpha = 1 - incremental_abolish[-1] 
+                wei = beta_clampy(wei, incremental_abolish[-1], mink=weitarget-inc_alpha, maxk=weitarget+inc_alpha)
             else: 
                 nonbeta_clampy(wei, mink=weitarget-local_epsilon, maxk=weitarget+local_epsilon)
         
-        if incremental_abolish:
-            incremental_abolish[0] = incremental_abolish[0]+0.01    #its so funny having to write an iterator in pydiom.
-            if incremental_abolish[0] >= 1:
-                incremental_abolish.clear()
+        if incremental_abolish is not None and incremental_abolish[-1] < 1:
+            incremental_abolish.append(incremental_abolish[-1]+incremental_abolish[0])     #its so funny having to write an iterator in pydiom.
+            #if incremental_abolish[-1] >= 1:
+            #    incremental_abolish.clear()
+            # old implementation.
 
     def lambda_clampbda(unet:SdxlUNet2DConditionModel, learnedlambdas=[]):
         for lambdas in learnedlambdas:
@@ -194,6 +195,19 @@ def append_block_lr_to_logs(block_lrs, logs, lr_scheduler, optimizer_type):
 
     train_util.append_lr_to_logs_with_names(logs, lr_scheduler, optimizer_type, names)
 
+def LOCAL_get_total_norm(parameters, norm_type=2):
+    with torch.no_grad():
+        if isinstance(parameters, torch.Tensor):
+            parameters = [parameters]
+        parameters = [p for p in parameters if p.grad is not None]
+        norm_type = float(norm_type)
+        if len(parameters) == 0:
+            return torch.tensor(0.)
+        device = parameters[0].grad.device
+        #p_for_norm = [p.grad.detach() for p in parameters]
+        #total_norm = torch.norm(torch.stack(p_for_norm), norm_type)
+        total_norm = torch.norm(torch.stack([torch.norm(p.grad.detach(), norm_type).to(device) for p in parameters]), norm_type)
+        return total_norm
 
 def train(args):
     train_util.verify_training_args(args)
@@ -285,6 +299,7 @@ def train(args):
     ds_for_collator = train_dataset_group if args.max_data_loader_n_workers == 0 else None
     collator = train_util.collator_class(current_epoch, current_step, ds_for_collator)
 
+    train_dataset_group.opencv2_interpolation_mode = args.opencv2_interpolation_mode
     train_dataset_group.verify_bucket_reso_steps(32)
 
     if args.debug_dataset:
@@ -320,15 +335,29 @@ def train(args):
     initdict={}
     initdict.update({"learnable_lambdas_level":args.learnable_lambdas_level})
     initdict.update({"swiglu_switcharoo":args.swiglu_switcharoo})
-    (
-        load_stable_diffusion_format,
-        text_encoder1,
-        text_encoder2,
-        vae,
-        unet,
-        logit_scale,
-        ckpt_info,
-    ) = sdxl_train_util.load_target_model(args, accelerator, "sdxl", weight_dtype, initdict=initdict)
+    if args.load_unet_EMA:
+            (
+            load_stable_diffusion_format,
+            text_encoder1,
+            text_encoder2,
+            vae,
+            unet,
+            unet_ema,
+            logit_scale,
+            ckpt_info,
+        ) = sdxl_train_util.load_target_model(args, accelerator, "sdxl", weight_dtype, initdict=initdict, unet_ema_load=args.load_unet_EMA)
+    else:
+        (
+            load_stable_diffusion_format,
+            text_encoder1,
+            text_encoder2,
+            vae,
+            unet,
+            logit_scale,
+            ckpt_info,
+        ) = sdxl_train_util.load_target_model(args, accelerator, "sdxl", weight_dtype, initdict=initdict)
+        #failsafe for model saving and loading i guess
+        unet_ema = None
     # logit_scale = logit_scale.to(accelerator.device, dtype=weight_dtype)
 
     if args.auxiliary_TE_loss_anthropic_style_baybee:
@@ -537,8 +566,11 @@ def train(args):
                     if 'weight' in name:
                         affinenormweights.append(name)
     
-    if args.incremental_abolish:
-        incremental_abolish_ls.append(args.incremental_abolish)
+    if args.incremental_abolish is not None:
+        #incremental_abolish_ls.append(args.incremental_abolish)
+        incremental_abolish_ls.append(args.incremental_abolish[0])
+        incremental_abolish_ls.append(args.incremental_abolish[1])
+
 
     if train_text_encoder1:
         training_models.append(text_encoder1)
@@ -648,6 +680,7 @@ def train(args):
         collate_fn=collator,
         num_workers=n_workers,
         persistent_workers=args.persistent_data_loader_workers,
+        pin_memory=args.pytorch_pinned_dataloader
     )
 
     # 学習ステップ数を計算する
@@ -688,12 +721,14 @@ def train(args):
         text_encoder1.to(weight_dtype)
         text_encoder2.to(weight_dtype)
    
+    """#nah
     if args.torch_compilealter:
         torch._inductor.config.conv_1x1_as_mm = True
         torch._inductor.config.coordinate_descent_tuning = True
         torch._inductor.config.epilogue_fusion = False
         torch._inductor.config.coordinate_descent_check_all_directions = True
-    
+    """
+
     unet_weight_dtype = te_weight_dtype = weight_dtype
     # Experimental Feature: Put base model into fp8 to save vram
     if args.fp8_base:
@@ -744,8 +779,11 @@ def train(args):
         # acceleratorがなんかよろしくやってくれるらしい
         if train_unet:
             unet = accelerator.prepare(unet)
-            if args.torch_compilealter:
-                unet = torch.compile(unet, fullgraph=False)
+            #if args.torch_compilealter:
+            #    unet = torch.compile(unet)
+            if args.load_unet_EMA:
+                unet_ema = accelerator.prepare(unet_ema)
+                unet_ema.requires_grad_(False)
         if train_text_encoder1:
             text_encoder1 = accelerator.prepare(text_encoder1)
         if train_text_encoder2:
@@ -827,20 +865,41 @@ def train(args):
                     if parameter.requires_grad:
 
                         def optimizer_hook(parameter: torch.Tensor):
+                            critical_grad_error = False
+                            if accelerator.sync_gradients:
+                                with torch.no_grad():
+                                    tennyfinny = torch.isfinite(parameter)
+                                    if not torch.any(tennyfinny):
+                                        accelerator.print(f"unspeakable critical gradient error. {parameter} contained nonfinite values {tennyfinny}")
+                                        accelerator.print(f"overriding batch!")
+                                        critical_grad_error = True
+                                    if not critical_grad_error:
+                                        if torch.abs(LOCAL_get_total_norm(parameter)) > (10*args.max_grad_norm):
+                                            accelerator.print(f"speakable critical gradient error. {parameter} measured norm greater than {10*args.max_grad_norm}")
+                                            accelerator.print(f"overriding batch!")
+                                            critical_grad_error = True
+
                             if accelerator.sync_gradients and args.max_grad_norm != 0.0:
                                 accelerator.clip_grad_norm_(parameter, args.max_grad_norm)
 
                             i = parameter_optimizer_map[parameter]
                             optimizer_hooked_count[i] += 1
                             if optimizer_hooked_count[i] == num_parameters_per_group[i]:
-                                optimizers[i].step()
-                                optimizers[i].zero_grad(set_to_none=True)
+                                if critical_grad_error:
+                                    optimizers[i].zero_grad(set_to_none=True)
+                                    accelerator.print(f"batch, hopefully, overridden. see you on the other side.")
+                                else:
+                                    optimizers[i].step()
                                 if args.bias_abolisher or args.layernorm_simple:
                                     for model in accelerator._models:
-                                        cleanup(
-                                            model, affinenormbiases=affinenormbiases, affinenormweights=affinenormweights, 
-                                            learnedlambdas=skipweight_params, 
-                                            incremental_abolish=incremental_abolish_ls)
+                                        with torch.no_grad():
+                                            cleanup(
+                                                model, affinenormbiases=affinenormbiases, affinenormweights=affinenormweights, 
+                                                learnedlambdas=skipweight_params, 
+                                                incremental_abolish=incremental_abolish_ls)
+
+                                optimizers[i].zero_grad(set_to_none=True)
+                                
 
                         parameter.register_post_accumulate_grad_hook(optimizer_hook)
                         parameter_optimizer_map[parameter] = opt_idx
@@ -851,6 +910,11 @@ def train(args):
     num_train_epochs = math.ceil(args.max_train_steps / num_update_steps_per_epoch)
     if (args.save_n_epoch_ratio is not None) and (args.save_n_epoch_ratio > 0):
         args.save_every_n_epochs = math.floor(num_train_epochs / args.save_n_epoch_ratio) or 1
+
+    if args.torch_compilealter:
+        accelerator.print("running compiling")
+        for m in training_models:
+            m = torch.compile(m)
 
     # 学習する
     # total_batch_size = args.train_batch_size * accelerator.num_processes * args.gradient_accumulation_steps
@@ -915,6 +979,7 @@ def train(args):
 
         for step, batch in enumerate(train_dataloader):
             current_step.value = global_step
+            critical_grad_error = False
 
             if args.fused_optimizer_groups:
                 optimizer_hooked_count = {i: 0 for i in range(len(optimizers))}  # reset counter for each step
@@ -931,7 +996,8 @@ def train(args):
                         if torch.any(torch.isnan(latents)):
                             accelerator.print("NaN found in latents, replacing with zeros")
                             latents = torch.nan_to_num(latents, 0, out=latents)
-                latents = latents * sdxl_model_util_lambdanet.VAE_SCALE_FACTOR
+                #latents = latents * sdxl_model_util_lambdanet.VAE_SCALE_FACTOR
+                latents = (latents * vae.config.scaling_factor) - vae.config.shift_factor
                 aux_loss = torch.tensor(0)
 
                 #this is when youre using the text encoders in live fire mode
@@ -1054,6 +1120,21 @@ def train(args):
                         te_aux_loss2 = te_aux_loss2.mean()
                         te_aux_loss += te_aux_loss2
                 
+                #https://arxiv.org/abs/2301.11093
+                if args.logscale_lambda_interp:
+                    assert args.logscale_lambda_references is not None
+                    smd_betascale_kwargs = copy.deepcopy(betascale_kwargs)
+                    noise_scheduler = DDPMScheduler(**smd_betascale_kwargs)
+                    prepare_scheduler_for_custom_training(noise_scheduler, accelerator.device)
+
+                    b, dims = target_size.shape[0], target_size.shape[1]
+                    unit_target_size = (target_size[0][1]*target_size[0][0])**0.5   #grab the first size along the batch dim :)
+                    ll_operand = (args.logscale_lambda_references[0], 
+                    args.logscale_lambda_references[1],
+                    unit_target_size)
+                    ll_l_t = custom_train_functions.logspace_interp_lambdas(noise_scheduler=noise_scheduler, secondshift=ll_operand)
+                    custom_train_functions.recompile_scheduler_from_logspace(noise_scheduler=noise_scheduler, new_lambdas=ll_l_t, ztsnr=args.zero_terminal_snr)
+                    
                 #sigmultiple_dozendrive
                 #what's in a LTRB?
                 #return crop_left, crop_top, crop_right, crop_bottom
@@ -1070,7 +1151,6 @@ def train(args):
                     else:
                         sigmax_scale = 1/4 #default case of... normal sdxl noise schedule, i think, since 1024/4=256 => (256/256)**0.5 => 1.0
 
-
                     if args.sigminimum_overdrive is not None:
                         sigmin_scale = args.sigminimum_overdrive/1024
                     else:
@@ -1083,7 +1163,7 @@ def train(args):
                     smd_betascale_kwargs["beta_end"]=0.012*sigmax_target
                     
                     #we shall presume resolution is invariant along a batch, might not be true under gradient accumulation or at all!
-                    sigmultiple_noise_scheduler = DDPMScheduler(
+                    noise_scheduler = DDPMScheduler(
                         **smd_betascale_kwargs
                     )
                     prepare_scheduler_for_custom_training(sigmultiple_noise_scheduler, accelerator.device)
@@ -1096,14 +1176,20 @@ def train(args):
                 # with noise offset and/or multires noise if specified
                 # for sigmultiple, you would want to do something even more different if we had multiple resolution scales per batch...
                 # and i think we don't?
+                """
                 if args.sigmultiple_dozendrive:
                     noise, noisy_latents, timesteps, huber_c = train_util.get_noise_noisy_latents_and_timesteps(
                         args, sigmultiple_noise_scheduler, latents
                     )
-                else:
+                elif args.logscale_lambda_interp:
                     noise, noisy_latents, timesteps, huber_c = train_util.get_noise_noisy_latents_and_timesteps(
-                        args, noise_scheduler, latents
+                        args, lli_schedule, latents
                     )
+                else:"""
+                #actually don't we break loss weighting if we isolate the LLI and sigmultiple noise schedulers from other logic?
+                noise, noisy_latents, timesteps, huber_c = train_util.get_noise_noisy_latents_and_timesteps(
+                    args, noise_scheduler, latents
+                )
 
                 noisy_latents = noisy_latents.to(weight_dtype)  # TODO check why noisy_latents is not weight_dtype
 
@@ -1142,9 +1228,10 @@ def train(args):
                     if args.multisampling_multiscale_loss and args.multiscale_latents_factors is not None:
                         lossifier = train_util.conditional_loss
                         loss_kwargs = {"reduction":"none", "loss_type":args.loss_type, "huber_c":huber_c, "cumtoggle":True, "args":args}
-                        loss = custom_train_functions.multisampling_multiscale_latents(
-                            lossfn=lossifier, loss_kwargs=loss_kwargs, target=target,pred=noise_pred,downscale_factors=args.multiscale_latents_factors, apply_masked_loss_flag = args.masked_loss, batch=batch)
-                    #caution: stacks the new resolution variants across a new axis.
+                        mumula_kwargs = {"lossfn":lossifier, "loss_kwargs":loss_kwargs, "target":target, "pred":noise_pred, "downscale_factors":args.multiscale_latents_factors, "apply_masked_loss_flag":args.masked_loss, "batch":batch}
+                        if args.multisampling_multiscale_interpmode is not None:
+                            mumula_kwargs["interpmode"] = args.multisampling_multiscale_interpmode
+                        loss = custom_train_functions.multisampling_multiscale_latents(**mumula_kwargs)
                     else:
                         loss = train_util.conditional_loss(
                             noise_pred.float(), target.float(), reduction="none", loss_type=args.loss_type, huber_c=huber_c, cumtoggle=True, args=args
@@ -1217,6 +1304,23 @@ def train(args):
 
                 if not (args.fused_backward_pass or args.fused_optimizer_groups):
                     #post-backpass non-hooked grad clipping implementation.
+                    critical_grad_error = False
+                    with torch.no_grad():
+                        for m in training_models:
+                            for pammer in m.parameters():
+                                tennyfinny = torch.isfinite(pammer)
+                                if not torch.any(tennyfinny) and not critical_grad_error:
+                                    accelerator.print(f"unspeakable critical gradient error. model contained nonfinite values")
+                                    accelerator.print(f"overriding batch!")
+                                    critical_grad_error = True
+                                if not critical_grad_error:
+                                    if torch.abs(LOCAL_get_total_norm(pammer)) > (10*args.max_grad_norm):
+                                        accelerator.print(f"speakable critical gradient error. model measured norm greater than {10*args.max_grad_norm}")
+                                        accelerator.print(f"overriding batch!")
+                                        critical_grad_error = True
+                        if critical_grad_error:
+                            optimizer.zero_grad(set_to_none=True)
+                            accelerator.print(f"batch, hopefully, overridden. see you on the other side.")
                     if accelerator.sync_gradients and args.max_grad_norm != 0.0:
                         params_to_clip = []
                         if clippables:  #are we clipping norms? no we're *training* norms!
@@ -1231,14 +1335,20 @@ def train(args):
                             params_to_clip = []
                             params_to_clip.extend(norm_params)
                             accelerator.clip_grad_norm_(params_to_clip, args.layernorm_gradient_clipping)
+                    if critical_grad_error:
+                        accelerator.print(f"skipping optimizer step to mitigate optimizer cache weirdness")
+                    else:
+                        optimizer.step()
+                        lr_scheduler.step()
 
-                    optimizer.step()
-                    lr_scheduler.step()
-                    optimizer.zero_grad(set_to_none=True)
                     if args.bias_abolisher or args.layernorm_simple:
                         #for model in accelerator._models:
                         #    cleanup( model, affinenormbiases=affinenormbiases, learnedlambdas=skipweight_params, incremental_abolish=incremental_abolish_ls)
-                        cleanup(unet, affinenormbiases=affinenormbiases, affinenormweights=affinenormweights, learnedlambdas=skipweight_params, incremental_abolish=incremental_abolish_ls)
+                        with torch.no_grad():
+                            cleanup(unet, affinenormbiases=affinenormbiases, affinenormweights=affinenormweights, learnedlambdas=skipweight_params, incremental_abolish=incremental_abolish_ls)
+
+                    optimizer.zero_grad(set_to_none=True)
+                    
                 else:
                     # optimizer.step() and optimizer.zero_grad() are called in the optimizer hook
                     lr_scheduler.step()
@@ -1263,6 +1373,20 @@ def train(args):
                     unet,
                     kwargs=betascale_kwargs
                 )
+                if args.load_unet_EMA:
+                    logger.info(f"EMA model samples:")
+                    sdxl_train_util.sample_images(
+                        accelerator,
+                        args,
+                        epoch + 1,
+                        global_step,
+                        accelerator.device,
+                        vae,
+                        [tokenizer1, tokenizer2],
+                        [text_encoder1, text_encoder2],
+                        unet_ema,
+                        kwargs=betascale_kwargs
+                    )
 
                 # 指定ステップごとにモデルを保存
                 if args.save_every_n_steps is not None and global_step % args.save_every_n_steps == 0:
@@ -1291,6 +1415,15 @@ def train(args):
                             accelerator.print(f"onsave biasminmax:{bias_yoinkems(unet=unet,affinenormbiases=affinenormbiases)}")
                         if args.layernorm_simple:
                             accelerator.print(f"onsave weightminmax:{bias_yoinkems(unet=unet,affinenormbiases=affinenormweights)}")
+            
+            #EMA update:
+            if unet_ema is not None:
+                with torch.no_grad():
+                    eub = torch.tensor(args.unet_EMA_beta)
+                    #unet_ema = unet_ema*eub + unet*(1-eub)
+                    for nomme, parme in unet_ema.named_parameters():
+                        parme.data = parme.mul(eub) + unet[nomme].data.mul(1-eub)
+                        #error is not subscriptable. try unet.state_dict[...]
 
             current_loss = loss.detach().item()  # 平均なのでbatch sizeは関係ないはず
             aux_current_loss = aux_loss.detach().item()
@@ -1302,7 +1435,7 @@ def train(args):
                     train_util.append_lr_to_logs(logs, lr_scheduler, args.optimizer_type, including_unet=train_unet)
                 else:
                     append_block_lr_to_logs(block_lrs, logs, lr_scheduler, args.optimizer_type)  # U-Net is included in block_lrs
-
+                logs["sigma_range"] = (noise_scheduler.sigma[0], noise_scheduler.sigma[-1])
                 accelerator.log(logs, step=global_step)
 
             loss_recorder.add(epoch=epoch, step=step, loss=current_loss)
@@ -1328,6 +1461,7 @@ def train(args):
         if args.save_every_n_epochs is not None:
             if accelerator.is_main_process:
                 src_path = src_stable_diffusion_ckpt if save_stable_diffusion_format else src_diffusers_model_path
+
                 sdxl_train_util.save_sd_model_on_epoch_end_or_stepwise(
                     args,
                     True,
@@ -1345,6 +1479,7 @@ def train(args):
                     vae,
                     logit_scale,
                     ckpt_info,
+                    unet_ema,
                 )
 
         sdxl_train_util.sample_images(
@@ -1357,6 +1492,20 @@ def train(args):
             [tokenizer1, tokenizer2],
             [text_encoder1, text_encoder2],
             unet,
+            kwargs=betascale_kwargs
+        )
+        if args.load_unet_EMA:
+            logger.info(f"EMA model samples:")
+            sdxl_train_util.sample_images(
+            accelerator,
+            args,
+            epoch + 1,
+            global_step,
+            accelerator.device,
+            vae,
+            [tokenizer1, tokenizer2],
+            [text_encoder1, text_encoder2],
+            unet_ema,
             kwargs=betascale_kwargs
         )
 
@@ -1379,21 +1528,39 @@ def train(args):
 
     if is_main_process:
         src_path = src_stable_diffusion_ckpt if save_stable_diffusion_format else src_diffusers_model_path
-        sdxl_train_util.save_sd_model_on_train_end(
-            args,
-            src_path,
-            save_stable_diffusion_format,
-            use_safetensors,
-            save_dtype,
-            epoch,
-            global_step,
-            text_encoder1,
-            text_encoder2,
-            unet,
-            vae,
-            logit_scale,
-            ckpt_info,
-        )
+        if args.load_unet_EMA:
+            sdxl_train_util.save_sd_model_on_train_end(
+                args,
+                src_path,
+                save_stable_diffusion_format,
+                use_safetensors,
+                save_dtype,
+                epoch,
+                global_step,
+                text_encoder1,
+                text_encoder2,
+                unet,
+                vae,
+                logit_scale,
+                ckpt_info,
+                unet_ema=unet_ema,
+            )
+        else:
+            sdxl_train_util.save_sd_model_on_train_end(
+                args,
+                src_path,
+                save_stable_diffusion_format,
+                use_safetensors,
+                save_dtype,
+                epoch,
+                global_step,
+                text_encoder1,
+                text_encoder2,
+                unet,
+                vae,
+                logit_scale,
+                ckpt_info,
+            )
         logger.info("model saved.")
 
 
@@ -1517,8 +1684,9 @@ def setup_parser() -> argparse.ArgumentParser:
     parser.add_argument(
         "--incremental_abolish",
         type=float,
+        nargs=2,
         default=None,
-        help="interpolation term between clamped and nonclamped layernorm biases. pick something between 0.01 and 0.9.",
+        help="interpolation term between clamped and nonclamped layernorm biases. pick stepsize , startvalue, e.g. 0.1, 0.2 for [0.2, 0.3, 0.4, 0.5, 0.6, ...]",
     )
     parser.add_argument(
         "--layernorm_simple",
@@ -1595,6 +1763,18 @@ def setup_parser() -> argparse.ArgumentParser:
         nargs=2,
         default=None,
         help="Clamp minimum,maximum scale of loss weighting in logspace e.g. (-23, 1) will allow a maximum *increase* in loss by e times.",
+    )
+    parser.add_argument(
+        "--load_unet_EMA",
+        action="store_true",
+        default=None,
+        help="EMA EMA EMA!",
+    )
+    parser.add_argument(
+        "--unet_EMA_beta",
+        type=float,
+        default=0.99,
+        help="how quickly you want that EMA to shift",
     )
     return parser
 

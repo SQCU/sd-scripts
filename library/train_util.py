@@ -6043,6 +6043,8 @@ def sample_image_inference(
         torch.cuda.empty_cache()
 
     image = pipeline.latents_to_image(latents)[0]
+    #latents_for_decode = latents.mul(torch.tensor(pipeline.vae.config.latents_mean)).add_(torch.tensor(pipeline.vae.config.latents_mean))
+    #image = pipeline.latents_to_image(latents_for_decode[0])
 
     # adding accelerator.wait_for_everyone() here should sync up and ensure that sample images are saved in the same order as the original prompt list
     # but adding 'enum' to the filename should be enough
@@ -6053,6 +6055,9 @@ def sample_image_inference(
     i: int = prompt_dict["enum"]
     img_filename = f"{'' if args.output_name is None else args.output_name + '_'}{num_suffix}_{i:02d}_{ts_str}{seed_suffix}.png"
     image.save(os.path.join(save_dir, img_filename))
+
+    #cleanup
+    #del latents_for_decode
 
     # wandb有効時のみログを送信
     try:

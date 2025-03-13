@@ -10,6 +10,7 @@ import toml
 from tqdm import tqdm
 
 import torch
+import torchvision
 from library.device_utils import init_ipex, clean_memory_on_device
 
 from torchjd import backward
@@ -997,7 +998,19 @@ def train(args):
                             accelerator.print("NaN found in latents, replacing with zeros")
                             latents = torch.nan_to_num(latents, 0, out=latents)
                 #latents = latents * sdxl_model_util_lambdanet.VAE_SCALE_FACTOR
-                latents = (latents * vae.config.scaling_factor) - vae.config.shift_factor
+                #latents = (latents * vae.config.scaling_factor) + vae.config.shift_factor
+                #latents = torchvision.transforms.functional.normalize(latents, mean=vae.config.latents_mean, std=vae.config.latents_std)
+
+                #print(latents.shape)
+                #print(torch.tensor(vae.config.latents_mean).shape)
+                
+                #latents_for_encode = latents.sub(latent_means).div(latents_std)
+                #latents_for_decode = latents.mul(latents_std).add(latent_means)
+                latent_means = torch.tensor(vae.config.latents_mean).to(device=accelerator.device).to(dtype=weight_dtype).unsqueeze(-1).unsqueeze(-1)
+                latents_std = torch.tensor(vae.config.latents_std).to(device=accelerator.device).to(dtype=weight_dtype).unsqueeze(-1).unsqueeze(-1)
+                #dont use inplaces just in case
+                latents = latents.sub(latent_means).div(latents_std)
+
                 aux_loss = torch.tensor(0)
 
                 #this is when youre using the text encoders in live fire mode

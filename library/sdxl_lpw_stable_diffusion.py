@@ -563,9 +563,25 @@ class SdxlStableDiffusionLongPromptWeightingPipeline:
         self.vae_scale_factor = 2 ** (len(self.vae.config.block_out_channels) - 1)
         self.progress_bar = lambda x: tqdm(x, leave=False)
 
+        self.vae_scaling_factor = vae.config.scaling_factor
+        self.vae_shift_factor = 0
+        if hasattr(vae.config, "shift_factor"):
+            self.vae_shift_factor = vae.config.shift_factor
+
+        self.latents_mean = None
+        self.latents_std = None
+
         self.clip_skip = clip_skip
         self.tokenizers = tokenizer
         self.text_encoders = text_encoder
+
+        if hasattr(vae.config, "latents_mean"):
+            with torch.no_grad():
+                #latents_for_encode = latents.sub(latent_means).div(latents_std)
+                #latents_for_decode = latents.div(latents_std).add(latent_means)
+                self.latent_means = torch.tensor(vae.config.latents_mean).to(device=self.vae.device).to(dtype=self.vae.dtype).unsqueeze(-1).unsqueeze(-1)
+                self.latents_std = torch.tensor(vae.config.latents_std).to(device=self.vae.device).to(dtype=self.vae.dtype).unsqueeze(-1).unsqueeze(-1)
+                #dont use inplaces just in case
 
     #     self.__init__additional__()
 
@@ -706,9 +722,13 @@ class SdxlStableDiffusionLongPromptWeightingPipeline:
             has_nsfw_concept = None
         return image, has_nsfw_concept
 
-    def decode_latents(self, latents, scalefactor=0.13025): #why didn't you use A FUCKING ARGUMENT!!! WHAT IS SO BAD ABOUT OPERANDS!!!
+    def decode_latents(self, latents):#, scalefactor=0.13025): #why didn't you use A FUCKING ARGUMENT!!! WHAT IS SO BAD ABOUT OPERANDS!!!
         with torch.no_grad():
-            latents = 1 / scalefactor * latents
+            if self.latent_means is not None:
+                latents = latents.mul(self.latents_std).add(self.latent_means)
+            else:
+                latents = (latents * self.vae_scaling_factor) + self.vae_shift_factor
+            #latents = 1 / scalefactor * latents
 
             # print("post_quant_conv dtype:", self.vae.post_quant_conv.weight.dtype)  # torch.float32
             # x = torch.nn.functional.conv2d(latents, self.vae.post_quant_conv.weight.detach(), stride=1, padding=0)
@@ -718,6 +738,8 @@ class SdxlStableDiffusionLongPromptWeightingPipeline:
             # image = self.vae.decode(latents.to("cpu")).sample
 
             image = self.vae.decode(latents.to(self.vae.dtype)).sample
+            
+            #suspicious. bitcrushes images if removed, rlly rlly cool tbh
             image = (image / 2 + 0.5).clamp(0, 1)
             # we always cast to float32 as this does not cause significant overhead and is compatible with bfloat16
             image = image.cpu().permute(0, 2, 3, 1).float().numpy()
@@ -765,8 +787,13 @@ class SdxlStableDiffusionLongPromptWeightingPipeline:
             return latents, None, None
         else:
             init_latent_dist = self.vae.encode(image).latent_dist
+            #if self.latent_means is not None:
+            #    init_latent_dist = init_latent_dist.mul(self.latent_means).div(self.latents_std)
             init_latents = init_latent_dist.sample(generator=generator)
-            init_latents = sdxl_model_util.VAE_SCALE_FACTOR * init_latents
+            if self.latent_means is not None:
+                init_latents = init_latents.sub(self.latent_means).div(self.latents_std)
+            else:
+                init_latents = self.vae_scaling_factor * init_latents 
             init_latents = torch.cat([init_latents] * batch_size, dim=0)
             init_latents_orig = init_latents
             shape = init_latents.shape

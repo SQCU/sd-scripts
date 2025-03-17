@@ -110,7 +110,6 @@ def get_norm_params(unet: SdxlUNet2DConditionModel):     #you would never believ
 
     return prosaic_params, norming_params
 
-
 def get_named_params(unet: SdxlUNet2DConditionModel , namestring: str):
     prosaic_params = []
     perspicacious_params = []
@@ -209,6 +208,66 @@ def LOCAL_get_total_norm(parameters, norm_type=2):
         #total_norm = torch.norm(torch.stack(p_for_norm), norm_type)
         total_norm = torch.norm(torch.stack([torch.norm(p.grad.detach(), norm_type).to(device) for p in parameters]), norm_type)
         return total_norm
+
+#from kohya-ss/sd-scripts/discussions/294
+def ztsnr_bar_alpha_via_delta(bar_alpha):
+    d_bar_alpha = torch.diff(bar_alpha, prepend=torch.tensor([1.0], device=bar_alpha.device))
+    d_bar_alpha_shifted = d_bar_alpha / (1-bar_alpha[-1])
+    return 1 - torch.cumsum(-d_bar_alpha_shifted, dim=0)
+
+def recompile_scheduler_from_bar_alpha(args, noise_scheduler, bar_alpha):
+    if args.ztsnr_bar_alpha_via_delta:
+        ztsnr_bar_alpha_via_delta(bar_alpha)
+    noise_scheduler.alphas_cumprod = bar_alpha
+    custom_train_functions.prepare_scheduler_for_custom_training(noise_scheduler, bar_alpha)
+
+#from kohya-ss/sd-scripts/discussions/294
+#remember this spits out an alpha_bar and sigma_bar (an alphascumprod in cum-centric notation)
+#as our other calls are mediated through the hface diffusers scheduling_ddpm formal object, 
+#which takes as operands: 
+#   SELFSTATE:ALPHAS_CUMPROD, OPERAND:ORIGINAL_SAMPLES, OPERAND:NOISE, OPERAND:TIMESTEPS,
+#and returns:
+#   torch.Tensor
+#we must *update* the noise schedule object to use our learnable schedule's values,
+#especially for compatibility with random other slices of code which expect scheduling_ddpm objects
+#to provide a surprising variety of goofy-ah-ah inner attributes!
+#   (this is a problem universal to message-passing within program architectures,
+#   and will persist no matter how you compose or denote your programmatic objects)
+class LearnableSigmoidKNSchedule(torch.nn.Module):
+    def __init__(self, betas):
+        super().__init__()
+        self.betas_learnable = torch.nn.Parameter(betas, requires_grad=False)
+        #bar_alpha = (1-betas).cumprod(0)
+        #snr = (bar_alpha / (1-bar_alpha)).log()
+
+        #self.snr_learnable = torch.nn.Parameter(snr, requires_grad=True)
+        #self.register_buffer(snr)
+        #actually... hm.
+        #don't register anything as a buffer in the init.
+        #but remember that recalculating this more than once per optimization step is kinda goofy. 
+
+        #note: avoid a zero init for either of these parameters!
+        #n_term_learnable absorbs shift updates wrt self.snr_learnable. equivalent by log product identity to (kingma, gao 2303.00848) sigmoid-k function.
+        self.n_term_learnable = torch.nn.Parameter(torch.tensor(1.1), requires_grad=True)
+        #k_term_learnable absorbs scale updates wrt self.snr_learnable. by log exponent identity equivalent to (cheald kohya-ss/sd-scripts/discussions/294) rescale_snr(...) function.
+        self.k_term_learnable = torch.nn.Parameter(torch.tensor(1.01), requires_grad=True)
+
+    #functional logsnr/lambda_t prevents a double update of both self.snr_learnable & self.betas_learnable
+    def lambda_t(self, betas, k_term):
+        bar_alpha = (1-betas).cumprod(0)
+        return (bar_alpha**k_term /(bar_alpha**k_term + (1-bar_alpha)**k_term)).log()
+
+    def forward(self):
+        #alpha_bar = torch.nn.functional.sigmoid(self.snr_learnable)
+        #sigma_bar = torch.nn.functional.sigmoid(-self.snr_learnable)
+
+        alpha_bar = torch.nn.functional.sigmoid(
+            self.lambda_t(self.betas_learnable, self.k_term_learnable) + self.n_term_learnable.log()
+            )
+        sigma_bar = torch.nn.functional.sigmoid(
+            -(self.lambda_t(self.betas_learnable, self.k_term_learnable) + self.n_term_learnable.log())
+            )
+        return alpha_bar, sigma_bar
 
 def train(args):
     train_util.verify_training_args(args)
@@ -572,13 +631,41 @@ def train(args):
         incremental_abolish_ls.append(args.incremental_abolish[0])
         incremental_abolish_ls.append(args.incremental_abolish[1])
 
-
     if train_text_encoder1:
         training_models.append(text_encoder1)
         params_to_optimize.append({"params": list(text_encoder1.parameters()), "lr": args.learning_rate_te1 or args.learning_rate})
     if train_text_encoder2:
         training_models.append(text_encoder2)
         params_to_optimize.append({"params": list(text_encoder2.parameters()), "lr": args.learning_rate_te2 or args.learning_rate})
+
+    betascale_kwargs={"num_train_timesteps":1000,"beta_start":0.00085,"beta_end":0.012,"beta_schedule":args.beta_schedule, "clip_sample":False}
+
+    #learnable schedule block must be instantiated before optimizer keyword overrides fire, since it has optimizable parameters
+    #schedule definition and normal scheduler moved to same territory so code doesn't become unreadable
+    learned_siggy_sheddy = None
+    if args.learnable_sigmoid_kn_schedule:
+        #always rember LDMs use the "scaled_linear" betas_schedule by default;
+        #wherein we root start and finish, then square entire schedule
+        betas_init = torch.linspace(
+            betascale_kwargs["beta_start"]**0.5,
+            betascale_kwargs["beta_end"]**0.5,
+            betascale_kwargs["num_train_timesteps"])**2
+        learned_siggy_sheddy = LearnableSigmoidKNSchedule(betas=betas_init)
+        params_to_optimize.append({"params": list(learned_siggy_sheddy.parameters()), "lr":args.lkns_lr or args.learning_rate})
+
+    if args.sigmaximum_overdrive:
+        betascale_kwargs["beta_end"]=0.012*((args.sigmaximum_overdrive/256)**0.5)
+    if args.sigminimum_overdrive:
+        betascale_kwargs["beta_start"]=0.00085*((args.sigminimum_overdrive/256)**0.5)
+
+    #normal schedule block
+    noise_scheduler = DDPMScheduler(
+    **betascale_kwargs
+    )
+    prepare_scheduler_for_custom_training(noise_scheduler, accelerator.device)
+    if args.zero_terminal_snr:
+        custom_train_functions.fix_noise_scheduler_betas_for_zero_terminal_snr(noise_scheduler)
+
 
     # calculate number of trainable parameters
     n_params = 0
@@ -593,10 +680,12 @@ def train(args):
     if args.norm_salvation:
         for nnp in clippables:
             n_notnorm_params += nnp.numel()
-
+        
     accelerator.print(f"train unet: {train_unet}, text_encoder1: {train_text_encoder1}, text_encoder2: {train_text_encoder2}")
     accelerator.print(f"number of models: {len(training_models)}")
     accelerator.print(f"number of trainable parameters: {n_params}")
+    if args.learnable_sigmoid_kn_schedule:
+        accelerator.print(f"and one very special learnable betas parameterization!")
     if args.norm_salvation:
         accelerator.print(f"number of split norm parameters: {n_norm_params}")
         accelerator.print(f"number of split non-norm parameters: {n_notnorm_params}\nplease be {n_params-n_norm_params}.")
@@ -801,7 +890,12 @@ def train(args):
                 auxiliary_text_encoder2 = accelerator.prepare(auxiliary_text_encoder2)
                 training_models.append(auxiliary_text_encoder2)
                 auxiliary_text_encoder2.to(accelerator.device)
-             
+        if args.learnable_sigmoid_kn_schedule:
+            learned_siggy_sheddy.to(weight_dtype)
+            learned_siggy_sheddy = accelerator.prepare(learned_siggy_sheddy)
+            training_models.append(learned_siggy_sheddy)
+            learned_siggy_sheddy.to(accelerator.device)
+            
 
     # TextEncoderの出力をキャッシュするときにはCPUへ移動する
     if args.cache_text_encoder_outputs:
@@ -935,22 +1029,6 @@ def train(args):
     progress_bar = tqdm(range(args.max_train_steps), smoothing=0, disable=not accelerator.is_local_main_process, desc="steps")
     global_step = 0
 
-    betascale_kwargs={"num_train_timesteps":1000,"beta_start":0.00085,"beta_end":0.012,"beta_schedule":args.beta_schedule, "clip_sample":False}
-
-    if args.sigmaximum_overdrive:
-        betascale_kwargs["beta_end"]=0.012*((args.sigmaximum_overdrive/256)**0.5)
-
-    if args.sigminimum_overdrive:
-        betascale_kwargs["beta_start"]=0.00085*((args.sigminimum_overdrive/256)**0.5)
-
-    noise_scheduler = DDPMScheduler(
-    **betascale_kwargs
-    )
-
-    prepare_scheduler_for_custom_training(noise_scheduler, accelerator.device)
-    if args.zero_terminal_snr:
-        custom_train_functions.fix_noise_scheduler_betas_for_zero_terminal_snr(noise_scheduler)
-
     if accelerator.is_main_process:
         init_kwargs = {}
         if args.wandb_run_name:
@@ -964,9 +1042,14 @@ def train(args):
         )
 
     # For --sample_at_first
+    sampler_kwargs = betascale_kwargs
+    if args.learnable_sigmoid_kn_schedule:
+        learned_betas_np = torch.tensor(learned_siggy_sheddy.betas_learnable).detach().to(dtype=torch.float32).detach().cpu().numpy()
+        sampler_kwargs = {"trained_betas":learned_betas_np}
+
     sdxl_train_util.sample_images(
         accelerator, args, 0, global_step, accelerator.device, vae, [tokenizer1, tokenizer2], [text_encoder1, text_encoder2], unet,
-        kwargs=betascale_kwargs
+        kwargs=sampler_kwargs
     )
 
     loss_recorder = train_util.LossRecorder()
@@ -1133,6 +1216,13 @@ def train(args):
                         te_aux_loss2 = te_aux_loss2.mean()
                         te_aux_loss += te_aux_loss2
                 
+                #from kohya-ss/sd-scripts/discussions/294
+
+                #this is where we do DDPMScheduler stuff:
+                if args.learnable_sigmoid_kn_schedule:
+                    alpha_bar, sigma_bar = learned_siggy_sheddy() #forwards() to synthesize new schedule
+                    recompile_scheduler_from_bar_alpha(args, noise_scheduler, alpha_bar)
+
                 #https://arxiv.org/abs/2301.11093
                 if args.logscale_lambda_interp:
                     assert args.logscale_lambda_references is not None
@@ -1373,6 +1463,11 @@ def train(args):
             if accelerator.sync_gradients:
                 progress_bar.update(1)
                 global_step += 1
+                
+                sampler_kwargs = betascale_kwargs
+                if args.learnable_sigmoid_kn_schedule:
+                    learned_betas_np = torch.tensor(learned_siggy_sheddy.betas_learnable).to(dtype=torch.float32).detach().cpu().numpy()
+                    sampler_kwargs = {"trained_betas":learned_betas_np}
 
                 sdxl_train_util.sample_images(
                     accelerator,
@@ -1384,7 +1479,7 @@ def train(args):
                     [tokenizer1, tokenizer2],
                     [text_encoder1, text_encoder2],
                     unet,
-                    kwargs=betascale_kwargs
+                    kwargs=sampler_kwargs
                 )
                 if args.load_unet_EMA:
                     logger.info(f"EMA model samples:")
@@ -1398,7 +1493,7 @@ def train(args):
                         [tokenizer1, tokenizer2],
                         [text_encoder1, text_encoder2],
                         unet_ema,
-                        kwargs=betascale_kwargs
+                        kwargs=sampler_kwargs
                     )
 
                 # 指定ステップごとにモデルを保存
@@ -1424,10 +1519,21 @@ def train(args):
                             logit_scale,
                             ckpt_info,
                         )
+                        if learned_siggy_sheddy is not None:
+                            os.makedirs(args.output_dir, exist_ok=True)
+                            lkns_name=args.output_name+".lkns"+".pt"
+                            lkns_file = os.path.join(args.output_dir, lkns_name)
+                            logger.info(f"save trained noise schedule checkpoint to {lkns_file}")
+                            torch.save(learned_siggy_sheddy, lkns_file)
                         if args.bias_abolisher or args.layernorm_simple:
                             accelerator.print(f"onsave biasminmax:{bias_yoinkems(unet=unet,affinenormbiases=affinenormbiases)}")
                         if args.layernorm_simple:
                             accelerator.print(f"onsave weightminmax:{bias_yoinkems(unet=unet,affinenormbiases=affinenormweights)}")
+                        if args.learnable_sigmoid_kn_schedule:
+                            accelerator.print(f"onsave l_n:{learned_siggy_sheddy.n_term_learnable} l_k:{learned_siggy_sheddy.k_term_learnable}")
+                            accelerator.print(f"onsave b_low:{learned_siggy_sheddy.betas_learnable[0]} b_high:{learned_siggy_sheddy.betas_learnable[-1]}")
+                                    
+                                    
             
             #EMA update:
             if unet_ema is not None:
@@ -1495,6 +1601,11 @@ def train(args):
                     unet_ema,
                 )
 
+        sampler_kwargs = betascale_kwargs
+        if args.learnable_sigmoid_kn_schedule:
+            learned_betas_np = torch.tensor(learned_siggy_sheddy.betas_learnable).to(dtype=torch.float32).detach().cpu().numpy()
+            sampler_kwargs = {"trained_betas":learned_betas_np}
+
         sdxl_train_util.sample_images(
             accelerator,
             args,
@@ -1505,7 +1616,7 @@ def train(args):
             [tokenizer1, tokenizer2],
             [text_encoder1, text_encoder2],
             unet,
-            kwargs=betascale_kwargs
+            kwargs=sampler_kwargs
         )
         if args.load_unet_EMA:
             logger.info(f"EMA model samples:")
@@ -1519,7 +1630,7 @@ def train(args):
             [tokenizer1, tokenizer2],
             [text_encoder1, text_encoder2],
             unet_ema,
-            kwargs=betascale_kwargs
+            kwargs=sampler_kwargs
         )
 
     is_main_process = accelerator.is_main_process
@@ -1533,6 +1644,9 @@ def train(args):
         accelerator.print(f"onsave biasminmax:{bias_yoinkems(unet=unet,affinenormbiases=affinenormbiases)}")
     if args.layernorm_simple:
         accelerator.print(f"onsave weightminmax:{bias_yoinkems(unet=unet,affinenormbiases=affinenormweights)}")
+    if args.learnable_sigmoid_kn_schedule:
+        accelerator.print(f"onsave l_n:{learned_siggy_sheddy.n_term_learnable} l_k:{learned_siggy_sheddy.k_term_learnable}")
+        accelerator.print(f"onsave b_low:{learned_siggy_sheddy.betas_learnable[0]} b_high:{learned_siggy_sheddy.betas_learnable[-1]}")
 
     if args.save_state or args.save_state_on_train_end:
         train_util.save_state_on_train_end(args, accelerator)
@@ -1575,6 +1689,12 @@ def train(args):
                 ckpt_info,
             )
         logger.info("model saved.")
+        if learned_siggy_sheddy is not None:
+            os.makedirs(args.output_dir, exist_ok=True)
+            lkns_name=args.output_name+".lkns"+".pt"
+            lkns_file = os.path.join(args.output_dir, lkns_name)
+            logger.info(f"save trained noise schedule checkpoint to {lkns_file}")
+            torch.save(learned_siggy_sheddy, lkns_file)
 
 
 def setup_parser() -> argparse.ArgumentParser:
@@ -1788,6 +1908,24 @@ def setup_parser() -> argparse.ArgumentParser:
         type=float,
         default=0.99,
         help="how quickly you want that EMA to shift",
+    )
+    parser.add_argument(
+        "--learnable_sigmoid_kn_schedule",
+        action="store_true",
+        default=None,
+        help="discussions-294 is back at it again",
+    )
+    parser.add_argument(
+        "--ztsnr_bar_alpha_via_delta",
+        action="store_true",
+        default=None,
+        help="so won't you reparameterize ztsnr with me here among the teeming mass of humanity? the universe has spared us this timestep",
+    )
+    parser.add_argument(
+        "--lkns_lr",
+        type=float,
+        default=None,
+        help="pass 1 learned sigmoid-kn-schedule lr vlue.",
     )
     return parser
 

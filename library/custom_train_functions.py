@@ -26,6 +26,13 @@ def prepare_scheduler_for_custom_training(noise_scheduler, device):
     all_snr = (alpha / sigma) ** 2
     lambda_t = torch.log(all_snr)
 
+    #reverse cumprod to retrieve alphas
+    alphas = alphas_cumprod[1:] / alphas_cumprod[:-1]
+    #prepend unmodified minimum alpha
+    alphas = torch.cat([alphas_cumprod[0:1],alphas])
+    betas = 1 - alphas
+
+    noise_scheduler.betas = betas.to(device)
     noise_scheduler.sigma = sigma.to(device)
     noise_scheduler.all_snr = all_snr.to(device)
     noise_scheduler.lambda_t = lambda_t.to(device)
@@ -44,7 +51,11 @@ def recompile_scheduler_from_logspace(noise_scheduler, new_lambdas, ztsnr=False,
     #reuse beta yoinkems from enforce_ztsnr
     #alphas = alpha2[1:]/alpha2[:-1]
     #alphas = torch.cat([alpha2[0:1],alphas])
-    alphas = alphas_cumprod**0.5
+
+    #reverse cumprod to retrieve alphas
+    alphas = alphas_cumprod[1:] / alphas_cumprod[:-1]
+    #prepend unmodified minimum alpha
+    alphas = torch.cat([alphas_cumprod[0:1],alphas])
     betas = 1 - alphas
 
     #write
@@ -207,8 +218,8 @@ def apply_salimans_vpred_weighting(loss, timesteps, noise_scheduler, v_predictio
 def apply_sigmoid_k_weighting(loss, timesteps, noise_scheduler, v_prediction=False, k_const=2):
     snr = torch.stack([noise_scheduler.all_snr[t] for t in timesteps])
     snr = torch.minimum(snr, torch.ones_like(snr) * 1000)
-    if v_prediction:
-        snr = snr+1
+    #if v_prediction:
+    #    snr = snr+1
     sigmo_loss = torch.sigmoid(-torch.log(snr)+k_const).float().to(dtype=loss.dtype, device=loss.device)
     loss = loss * sigmo_loss
     return loss

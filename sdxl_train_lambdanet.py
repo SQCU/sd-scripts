@@ -115,7 +115,7 @@ def get_named_params(unet: SdxlUNet2DConditionModel , namestring: str):
     perspicacious_params = []
     def unet_nameyoink(name, checkstring):
         #check = namestring.lower()
-        check = namestring#.lower()
+        check = checkstring#.lower()
         return check in name#.lower()
         
     for i, (name, param) in enumerate(unet.named_parameters()):
@@ -269,7 +269,7 @@ class LearnableSigmoidKNSchedule(torch.nn.Module):
         #n_term_learnable absorbs shift updates wrt self.betas_learnable. 
         #...equivalent by log product identity to (kingma, gao 2303.00848) sigmoid-k function,
         #if and only if you sum it without logging it? why was i optimizing this one through a log()?
-        self.n_term_learnable = learnable_logspace_n(torch.tensor(1.0), requires_grad=True)
+        self.n_term_learnable = learnable_logspace_n(torch.tensor(0.0), requires_grad=True)
         #k_term_learnable absorbs scale updates wrt self.snr_learnable. by log exponent identity equivalent to (cheald kohya-ss/sd-scripts/discussions/294) rescale_snr(...) function.
         self.k_term_learnable = learnable_logspace_k(torch.tensor(1.0), requires_grad=False)
 
@@ -412,6 +412,8 @@ def train(args):
     initdict={}
     initdict.update({"learnable_lambdas_level":args.learnable_lambdas_level})
     initdict.update({"swiglu_switcharoo":args.swiglu_switcharoo})
+    if args.sage_attn is not None:
+        initdict.update({"sage_attn":args.sage_attn})
     if args.load_unet_EMA:
             (
             load_stable_diffusion_format,
@@ -594,7 +596,7 @@ def train(args):
 
     training_models = []
     params_to_optimize = []
-    if train_unet:
+    if train_unet and not args.rehabilitate_QKV:
         training_models.append(unet)
         if block_lrs is None:
             params_to_optimize.append({"params": list(unet.parameters()), "lr": args.learning_rate})
@@ -604,6 +606,17 @@ def train(args):
     if args.norm_salvation:
         clippables, norm_params = get_norm_params(unet)
     clippables_beta, skipweight_params = get_named_params(unet=unet, namestring="learnedlambda") # mask=norm_params)
+    if args.rehabilitate_QKV:
+        projstrings = ["to_q",
+        "to_k",
+        "to_v", 
+        "to_out"]
+        qkv_params = []
+        for projstring in projstrings:
+            qkv_params.extend(get_named_params(unet=unet, namestring=projstring)[1])
+        logger.info(f"QKV_PARAMS:{len(qkv_params)}")   
+        training_models.append(unet)
+        params_to_optimize.append({"params":qkv_params, "lr": args.learning_rate})
     if clippables:
         clippables = set(clippables) - set(clippables_beta)
         clippables = list(clippables)
@@ -687,6 +700,8 @@ def train(args):
     prepare_scheduler_for_custom_training(noise_scheduler, accelerator.device)
     if args.zero_terminal_snr:
         custom_train_functions.fix_noise_scheduler_betas_for_zero_terminal_snr(noise_scheduler)
+
+    noise_scheduler_backup = None
 
     # calculate number of trainable parameters
     n_params = 0
@@ -1029,6 +1044,9 @@ def train(args):
 
     if args.torch_compilealter:
         accelerator.print("running compiling")
+        from torch.backends.cuda import enable_cudnn_sdp, enable_flash_sdp
+        enable_cudnn_sdp(True)
+        enable_flash_sdp(True)
         for m in training_models:
             m = torch.compile(m)
 
@@ -1064,12 +1082,15 @@ def train(args):
 
     # For --sample_at_first
     sampler_kwargs = betascale_kwargs
+    if args.v_parameterization:
+        sampler_kwargs["prediction_type"] = "v_prediction"
     if args.learnable_sigmoid_kn_schedule:
         shimsched = DDPMScheduler(**betascale_kwargs)
         alpha_bar, sigma_bar = learned_siggy_sheddy()
         recompile_scheduler_from_bar_alpha(args, shimsched, alpha_bar)
         learned_betas_np = torch.tensor(shimsched.betas).detach().to(dtype=torch.float32).detach().cpu().numpy()
-        sampler_kwargs = {"trained_betas":learned_betas_np}
+        sampler_kwargs["trained_betas"]=learned_betas_np
+        accelerator.print(f"b_low:{learned_betas_np[0]} b_high:{learned_betas_np[-1]}")
         del shimsched, alpha_bar, sigma_bar
 
     sdxl_train_util.sample_images(
@@ -1108,6 +1129,7 @@ def train(args):
                         if torch.any(torch.isnan(latents)):
                             accelerator.print("NaN found in latents, replacing with zeros")
                             latents = torch.nan_to_num(latents, 0, out=latents)
+                # original implementation:
                 #latents = latents * sdxl_model_util_lambdanet.VAE_SCALE_FACTOR
                 #latents = (latents * vae.config.scaling_factor) + vae.config.shift_factor
                 #latents = torchvision.transforms.functional.normalize(latents, mean=vae.config.latents_mean, std=vae.config.latents_std)
@@ -1117,138 +1139,29 @@ def train(args):
                 
                 #latents_for_encode = latents.sub(latent_means).div(latents_std)
                 #latents_for_decode = latents.mul(latents_std).add(latent_means)
-                latent_means = torch.tensor(vae.config.latents_mean).to(device=accelerator.device).to(dtype=weight_dtype).unsqueeze(-1).unsqueeze(-1)
-                latents_std = torch.tensor(vae.config.latents_std).to(device=accelerator.device).to(dtype=weight_dtype).unsqueeze(-1).unsqueeze(-1)
-                #dont use inplaces just in case
-                latents = latents.sub(latent_means).div(latents_std)
+                if args.latent_channel_variance_to_unit_scale:
+                    if hasattr(vae.config, "latents_mean"):
+                        latent_means = torch.tensor(vae.config.latents_mean).to(device=accelerator.device).to(dtype=weight_dtype).unsqueeze(-1).unsqueeze(-1)
+                        latents_std = torch.tensor(vae.config.latents_std).to(device=accelerator.device).to(dtype=weight_dtype).unsqueeze(-1).unsqueeze(-1)
+                        #dont use inplaces just in case
+                        latents = latents.sub(latent_means).div(latents_std)
+                    elif hasattr(vae.config, "shift_factor"):
+                        latents = (latents * vae.config.scaling_factor) + vae.config.shift_factor
+                else:
+                    latent_scale = sdxl_model_util_lambdanet.VAE_SCALE_FACTOR
+                    if hasattr(vae.config, "scaling_factor"):
+                        latent_scale = vae.config["scaling_factor"]
+                    latents = latents * latent_scale 
 
                 aux_loss = torch.tensor(0)
 
-                #this is when youre using the text encoders in live fire mode
-                if "text_encoder_outputs1_list" not in batch or batch["text_encoder_outputs1_list"] is None:
-                    input_ids1 = batch["input_ids"]
-                    input_ids2 = batch["input_ids2"]
-                    with torch.set_grad_enabled(args.train_text_encoder):   #fussy way of 
-                        # Get the text embedding for conditioning
-                        # TODO support weighted captions
-                        # if args.weighted_captions:
-                        #     encoder_hidden_states = get_weighted_text_embeddings(
-                        #         tokenizer,
-                        #         text_encoder,
-                        #         batch["captions"],
-                        #         accelerator.device,
-                        #         args.max_token_length // 75 if args.max_token_length else 1,
-                        #         clip_skip=args.clip_skip,
-                        #     )
-                        # else:
-                        input_ids1 = input_ids1.to(accelerator.device)
-                        input_ids2 = input_ids2.to(accelerator.device)
-                        # unwrap_model is fine for models not wrapped by accelerator
-                        encoder_hidden_states1, encoder_hidden_states2, pool2 = train_util.get_hidden_states_sdxl(
-                            args.max_token_length,
-                            input_ids1,
-                            input_ids2,
-                            tokenizer1,
-                            tokenizer2,
-                            text_encoder1,
-                            text_encoder2,
-                            None if not args.full_fp16 else weight_dtype,
-                            accelerator=accelerator,
-                        )
-                    if args.auxiliary_TE_loss_anthropic_style_baybee:
-                        au_h_args = [args.max_token_length,
-                            input_ids1,
-                            input_ids2,
-                            tokenizer1,
-                            tokenizer2,
-                            text_encoder1,
-                            text_encoder2,
-                            None if not args.full_fp16 else weight_dtype,
-                            ]
-                        au_h_kwargs = {"accelerator":accelerator}
-                        if train_text_encoder1:
-                            au_h_args[-3]=auxiliary_text_encoder1
-                        if train_text_encoder2:
-                            au_h_args[-2]=auxiliary_text_encoder2
 
-                        auxiliary_encoder_hidden_states1, auxiliary_encoder_hidden_states2, shim_pool2 = train_util.get_hidden_states_sdxl(
-                            *au_h_args, **au_h_kwargs
-                        )
-                        del shim_pool2
-                        clean_memory_on_device(accelerator.device)
-
-
-                else:   #this is when ur reusing cached TE embeddings
-                    encoder_hidden_states1 = batch["text_encoder_outputs1_list"].to(accelerator.device).to(weight_dtype)
-                    encoder_hidden_states2 = batch["text_encoder_outputs2_list"].to(accelerator.device).to(weight_dtype)
-                    pool2 = batch["text_encoder_pool2_list"].to(accelerator.device).to(weight_dtype)
-
-                    # # verify that the text encoder outputs are correct
-                    # ehs1, ehs2, p2 = train_util.get_hidden_states_sdxl(
-                    #     args.max_token_length,
-                    #     batch["input_ids"].to(text_encoder1.device),
-                    #     batch["input_ids2"].to(text_encoder1.device),
-                    #     tokenizer1,
-                    #     tokenizer2,
-                    #     text_encoder1,
-                    #     text_encoder2,
-                    #     None if not args.full_fp16 else weight_dtype,
-                    # )
-                    # b_size = encoder_hidden_states1.shape[0]
-                    # assert ((encoder_hidden_states1.to("cpu") - ehs1.to(dtype=weight_dtype)).abs().max() > 1e-2).sum() <= b_size * 2
-                    # assert ((encoder_hidden_states2.to("cpu") - ehs2.to(dtype=weight_dtype)).abs().max() > 1e-2).sum() <= b_size * 2
-                    # assert ((pool2.to("cpu") - p2.to(dtype=weight_dtype)).abs().max() > 1e-2).sum() <= b_size * 2
-                    # logger.info("text encoder outputs verified")
-
-                # get size embeddings
-                orig_size = batch["original_sizes_hw"]
-                crop_size = batch["crop_top_lefts"]
-                target_size = batch["target_sizes_hw"]
-                embs = sdxl_train_util.get_size_embeddings(orig_size, crop_size, target_size, accelerator.device).to(weight_dtype)
-
-                # concat embeddings
-                vector_embedding = torch.cat([pool2, embs], dim=1).to(weight_dtype)
-                text_embedding = torch.cat([encoder_hidden_states1, encoder_hidden_states2], dim=2).to(weight_dtype)
-                #collect auxiliary loss against reference text encoder
-                if args.auxiliary_TE_loss_anthropic_style_baybee:
-                    #auxiliary_text_embedding = torch.cat([auxiliary_encoder_hidden_states1, auxiliary_encoder_hidden_states2], dim=2).to(weight_dtype)
-
-                    kloss = torch.nn.KLDivLoss(log_target= True, reduction = "batchmean")
-                    mseloss = torch.nn.MSELoss(reduction='none')
-                    te_aux_loss=0
-                    te_aux_loss1 = torch.zeros_like(encoder_hidden_states1)
-                    te_aux_loss2 = torch.zeros_like(encoder_hidden_states2)
-
-                    #haha
-                    #te_aux_loss = kloss(textembed_old, textembed_new)
-                    #te_aux_loss = kloss(encoder_hidden_states1.log(), auxiliary_encoder_hidden_states1.log())
-                    #te_aux_loss += kloss(encoder_hidden_states2.log(), auxiliary_encoder_hidden_states2.log())
-
-                    if train_text_encoder1:
-                        te_aux_loss1 = mseloss(encoder_hidden_states1,auxiliary_encoder_hidden_states1)
-                        if torch.any(torch.isnan(te_aux_loss1)):
-                            #rev1
-                            accelerator.print("NaN found in embedding comparison, replacing with zeros")
-                            #te_aux_loss1 = torch.nan_to_num(te_aux_loss1, nan=0, posinf=0, neginf=0)
-                            #rev2
-                            te_aux_loss1 = torch.zeros_like(encoder_hidden_states1)
-                        te_aux_loss1 = te_aux_loss1.mean()
-                        te_aux_loss += te_aux_loss1
-                    if train_text_encoder2:
-                        te_aux_loss2 = mseloss(encoder_hidden_states2,auxiliary_encoder_hidden_states2)
-                        if torch.any(torch.isnan(te_aux_loss2)):
-                            #rev1
-                            accelerator.print("NaN found in embedding comparison, replacing with zeros")
-                            #te_aux_loss2 = torch.nan_to_num(te_aux_loss2, nan=0, posinf=0, neginf=0)
-                            #rev2
-                            te_aux_loss2 = torch.zeros_like(encoder_hidden_states2)
-                        te_aux_loss2 = te_aux_loss2.mean()
-                        te_aux_loss += te_aux_loss2
-                
                 #from kohya-ss/sd-scripts/discussions/294
 
                 #this is where we do DDPMScheduler stuff:
                 if args.learnable_sigmoid_kn_schedule:
+                    #...
+                    noise_scheduler = DDPMScheduler(**betascale_kwargs)
                     alpha_bar, sigma_bar = learned_siggy_sheddy() #forwards() to synthesize new schedule
                     recompile_scheduler_from_bar_alpha(args, noise_scheduler, alpha_bar)
 
@@ -1329,7 +1242,134 @@ def train(args):
                     noise_comp = (noise_scheduler.alphas_cumprod.sqrt() + (1 - noise_scheduler.alphas_cumprod).sqrt()).to(dtype=weight_dtype, device=latents.device)
                     noisy_latents = noisy_latents / noise_comp[timesteps].reshape(-1, 1, 1, 1)
 
+                                #this is when youre using the text encoders in live fire mode
+                if "text_encoder_outputs1_list" not in batch or batch["text_encoder_outputs1_list"] is None:
+                    input_ids1 = batch["input_ids"]
+                    input_ids2 = batch["input_ids2"]
+                    with torch.set_grad_enabled(args.train_text_encoder):   #fussy way of 
+                        # Get the text embedding for conditioning
+                        # TODO support weighted captions
+                        # if args.weighted_captions:
+                        #     encoder_hidden_states = get_weighted_text_embeddings(
+                        #         tokenizer,
+                        #         text_encoder,
+                        #         batch["captions"],
+                        #         accelerator.device,
+                        #         args.max_token_length // 75 if args.max_token_length else 1,
+                        #         clip_skip=args.clip_skip,
+                        #     )
+                        # else:
+                        input_ids1 = input_ids1.to(accelerator.device)
+                        input_ids2 = input_ids2.to(accelerator.device)
+                        # unwrap_model is fine for models not wrapped by accelerator
+                        # 
+                        encoder_hidden_states1, encoder_hidden_states2, pool2 = train_util.get_hidden_states_sdxl(
+                            args.max_token_length,
+                            input_ids1,
+                            input_ids2,
+                            tokenizer1,
+                            tokenizer2,
+                            text_encoder1,
+                            text_encoder2,
+                            None if not args.full_fp16 else weight_dtype,
+                            accelerator=accelerator,
+                        )
+                    if args.auxiliary_TE_loss_anthropic_style_baybee:
+                        au_h_args = [args.max_token_length,
+                            input_ids1,
+                            input_ids2,
+                            tokenizer1,
+                            tokenizer2,
+                            text_encoder1,
+                            text_encoder2,
+                            None if not args.full_fp16 else weight_dtype,
+                            ]
+                        au_h_kwargs = {"accelerator":accelerator}
+                        if train_text_encoder1:
+                            au_h_args[-3]=auxiliary_text_encoder1
+                        if train_text_encoder2:
+                            au_h_args[-2]=auxiliary_text_encoder2
+
+                        auxiliary_encoder_hidden_states1, auxiliary_encoder_hidden_states2, shim_pool2 = train_util.get_hidden_states_sdxl(
+                            *au_h_args, **au_h_kwargs
+                        )
+                        del shim_pool2
+                        clean_memory_on_device(accelerator.device)
+
+
+                else:   #this is when ur reusing cached TE embeddings
+                    encoder_hidden_states1 = batch["text_encoder_outputs1_list"].to(accelerator.device).to(weight_dtype)
+                    encoder_hidden_states2 = batch["text_encoder_outputs2_list"].to(accelerator.device).to(weight_dtype)
+                    pool2 = batch["text_encoder_pool2_list"].to(accelerator.device).to(weight_dtype)
+
+                    # # verify that the text encoder outputs are correct
+                    # ehs1, ehs2, p2 = train_util.get_hidden_states_sdxl(
+                    #     args.max_token_length,
+                    #     batch["input_ids"].to(text_encoder1.device),
+                    #     batch["input_ids2"].to(text_encoder1.device),
+                    #     tokenizer1,
+                    #     tokenizer2,
+                    #     text_encoder1,
+                    #     text_encoder2,
+                    #     None if not args.full_fp16 else weight_dtype,
+                    # )
+                    # b_size = encoder_hidden_states1.shape[0]
+                    # assert ((encoder_hidden_states1.to("cpu") - ehs1.to(dtype=weight_dtype)).abs().max() > 1e-2).sum() <= b_size * 2
+                    # assert ((encoder_hidden_states2.to("cpu") - ehs2.to(dtype=weight_dtype)).abs().max() > 1e-2).sum() <= b_size * 2
+                    # assert ((pool2.to("cpu") - p2.to(dtype=weight_dtype)).abs().max() > 1e-2).sum() <= b_size * 2
+                    # logger.info("text encoder outputs verified")
+
+                if args.conds_variance_to_latents_scale:
+                    for text_conds in [encoder_hidden_states1, encoder_hidden_states2]:
+                        text_conds = text_conds / text_conds.std(dim=(1, 2), keepdim=True) * latents.std(dim=(1, 2, 3)).view(-1, 1, 1)
+
+                # get size embeddings
+                orig_size = batch["original_sizes_hw"]
+                crop_size = batch["crop_top_lefts"]
+                target_size = batch["target_sizes_hw"]
+                embs = sdxl_train_util.get_size_embeddings(orig_size, crop_size, target_size, accelerator.device).to(weight_dtype)
+
+                # concat embeddings
+                vector_embedding = torch.cat([pool2, embs], dim=1).to(weight_dtype)
+                text_embedding = torch.cat([encoder_hidden_states1, encoder_hidden_states2], dim=2).to(weight_dtype)
+                #collect auxiliary loss against reference text encoder
+                if args.auxiliary_TE_loss_anthropic_style_baybee:
+                    #auxiliary_text_embedding = torch.cat([auxiliary_encoder_hidden_states1, auxiliary_encoder_hidden_states2], dim=2).to(weight_dtype)
+
+                    kloss = torch.nn.KLDivLoss(log_target= True, reduction = "batchmean")
+                    mseloss = torch.nn.MSELoss(reduction='none')
+                    te_aux_loss=0
+                    te_aux_loss1 = torch.zeros_like(encoder_hidden_states1)
+                    te_aux_loss2 = torch.zeros_like(encoder_hidden_states2)
+
+                    #haha
+                    #te_aux_loss = kloss(textembed_old, textembed_new)
+                    #te_aux_loss = kloss(encoder_hidden_states1.log(), auxiliary_encoder_hidden_states1.log())
+                    #te_aux_loss += kloss(encoder_hidden_states2.log(), auxiliary_encoder_hidden_states2.log())
+
+                    if train_text_encoder1:
+                        te_aux_loss1 = mseloss(encoder_hidden_states1,auxiliary_encoder_hidden_states1)
+                        if torch.any(torch.isnan(te_aux_loss1)):
+                            #rev1
+                            accelerator.print("NaN found in embedding comparison, replacing with zeros")
+                            #te_aux_loss1 = torch.nan_to_num(te_aux_loss1, nan=0, posinf=0, neginf=0)
+                            #rev2
+                            te_aux_loss1 = torch.zeros_like(encoder_hidden_states1)
+                        te_aux_loss1 = te_aux_loss1.mean()
+                        te_aux_loss += te_aux_loss1
+                    if train_text_encoder2:
+                        te_aux_loss2 = mseloss(encoder_hidden_states2,auxiliary_encoder_hidden_states2)
+                        if torch.any(torch.isnan(te_aux_loss2)):
+                            #rev1
+                            accelerator.print("NaN found in embedding comparison, replacing with zeros")
+                            #te_aux_loss2 = torch.nan_to_num(te_aux_loss2, nan=0, posinf=0, neginf=0)
+                            #rev2
+                            te_aux_loss2 = torch.zeros_like(encoder_hidden_states2)
+                        te_aux_loss2 = te_aux_loss2.mean()
+                        te_aux_loss += te_aux_loss2
+
                 # Predict the noise residual
+                # this is the network evaluation we're optimizing!
                 #z_list = torch.tensor(0.)
                 with accelerator.autocast():
                     noise_pred = unet(noisy_latents, timesteps, text_embedding, vector_embedding, ) #auxcum=z_list
@@ -1341,6 +1381,7 @@ def train(args):
                 else:
                     target = noise
                 
+
                 if ( 
                     args.min_snr_gamma
                     or args.scale_v_pred_loss_like_noise_pred
@@ -1493,14 +1534,18 @@ def train(args):
             if accelerator.sync_gradients:
                 progress_bar.update(1)
                 global_step += 1
+
+    
                 
                 sampler_kwargs = betascale_kwargs
+                if args.v_parameterization:
+                    sampler_kwargs["prediction_type"] = "v_prediction"
                 if args.learnable_sigmoid_kn_schedule and global_step % args.sample_every_n_steps == 0:
                     shimsched = DDPMScheduler(**betascale_kwargs)
                     alpha_bar, sigma_bar = learned_siggy_sheddy()
                     recompile_scheduler_from_bar_alpha(args, shimsched, alpha_bar)
                     learned_betas_np = torch.tensor(shimsched.betas).detach().to(dtype=torch.float32).detach().cpu().numpy()
-                    sampler_kwargs = {"trained_betas":learned_betas_np}
+                    sampler_kwargs["trained_betas"]=learned_betas_np
                     del shimsched, alpha_bar, sigma_bar
                     lkns_printer()
 
@@ -1636,12 +1681,14 @@ def train(args):
                 )
 
         sampler_kwargs = betascale_kwargs
+        if args.v_parameterization:
+            sampler_kwargs["prediction_type"] = "v_prediction"
         if args.learnable_sigmoid_kn_schedule:
             shimsched = DDPMScheduler(**betascale_kwargs)
             alpha_bar, sigma_bar = learned_siggy_sheddy()
             recompile_scheduler_from_bar_alpha(args, shimsched, alpha_bar)
             learned_betas_np = torch.tensor(shimsched.betas).detach().to(dtype=torch.float32).detach().cpu().numpy()
-            sampler_kwargs = {"trained_betas":learned_betas_np}
+            sampler_kwargs["trained_betas"]=learned_betas_np
             del shimsched, alpha_bar, sigma_bar
             lkns_printer()
 
@@ -1964,6 +2011,30 @@ def setup_parser() -> argparse.ArgumentParser:
         type=float,
         default=None,
         help="pass 1 learned sigmoid-kn-schedule lr vlue.",
+    )
+    parser.add_argument(
+        "--sage_attn",
+        action="store_true",
+        default=None,
+        help="it's sage attention!",
+    )
+    parser.add_argument(
+        "--conds_variance_to_latents_scale",
+        action="store_true",
+        default=None,
+        help="it's discussions-294!",
+    )
+    parser.add_argument(
+        "--latent_channel_variance_to_unit_scale",
+        action="store_true",
+        default=None,
+        help="'...in hopes of encouraging a scale and shift of training practices...'",
+    )
+    parser.add_argument(
+        "--rehabilitate_QKV",
+        action="store_true",
+        default=None,
+        help="avoid training any parts of the model besides attention QKV projections.",
     )
     return parser
 

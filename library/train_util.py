@@ -4894,7 +4894,10 @@ def prepare_accelerator(args: argparse.Namespace):
 
     # torch.compile のオプション。 NO の場合は torch.compile は使わない
     #dynamo_backend = "NO"
-    #if args.torch_compile:
+    if args.torch_compile:
+        from torch.backends.cuda import enable_cudnn_sdp, enable_flash_sdp
+        enable_cudnn_sdp(True)
+        enable_flash_sdp(True)
     #    dynamo_backend = args.dynamo_backend
     dynamo_backend = args.dynamo_backend
 
@@ -5882,14 +5885,19 @@ def sample_images_common(
     elif args.sample_prompts.endswith(".json"):
         with open(args.sample_prompts, "r", encoding="utf-8") as f:
             prompts = json.load(f)
-    if kwargs == None:
-        kwargs={}
-        #safeguard against creating a global dict for all calls of this fn or something.
 
-    beta_parameterization_keys = ("num_train_timesteps","beta_start","beta_end","beta_schedule")
-    scheduler_kwargs = {key:kwargs[key] for key in kwargs.keys() if key in beta_parameterization_keys}
-    if scheduler_kwargs:
-        logger.info(f"nonstandard betas suspected:{scheduler_kwargs}")
+    if kwargs == None:
+        scheduler_kwargs={}
+        #safeguard against creating a global dict for all calls of this fn or something.
+    else:
+        scheduler_kwargs = kwargs
+
+    #actually this filter right here might block learned betas from reaching the training sampler? worrying.
+    #beta_parameterization_keys = ("num_train_timesteps","beta_start","beta_end","beta_schedule")
+    #scheduler_kwargs = {key:kwargs[key] for key in kwargs.keys() if key in beta_parameterization_keys}
+    #if scheduler_kwargs:
+    #    logger.info(f"nonstandard betas suspected:{scheduler_kwargs}")
+
 
     default_scheduler = get_my_scheduler(
         sample_sampler=args.sample_sampler,
@@ -6042,8 +6050,9 @@ def sample_image_inference(
     with torch.cuda.device(torch.cuda.current_device()):
         torch.cuda.empty_cache()
 
+    #latents_for_decode = latents.mul(torch.tensor(pipeline.vae.config.latents_std)).add_(torch.tensor(pipeline.vae.config.latents_mean))
+    #buried in sdxl_lpw_stable_diffusion.py instead to supplant channel-averaged scale factor code
     image = pipeline.latents_to_image(latents)[0]
-    #latents_for_decode = latents.mul(torch.tensor(pipeline.vae.config.latents_mean)).add_(torch.tensor(pipeline.vae.config.latents_mean))
     #image = pipeline.latents_to_image(latents_for_decode[0])
 
     # adding accelerator.wait_for_everyone() here should sync up and ensure that sample images are saved in the same order as the original prompt list

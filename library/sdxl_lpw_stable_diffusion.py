@@ -722,13 +722,14 @@ class SdxlStableDiffusionLongPromptWeightingPipeline:
             has_nsfw_concept = None
         return image, has_nsfw_concept
 
-    def decode_latents(self, latents):#, scalefactor=0.13025): #why didn't you use A FUCKING ARGUMENT!!! WHAT IS SO BAD ABOUT OPERANDS!!!
+    def decode_latents(self, latents, scalefactor=0.13025): #why didn't you use A FUCKING ARGUMENT!!! WHAT IS SO BAD ABOUT OPERANDS!!!
         with torch.no_grad():
-            if self.latent_means is not None:
+            #if self.latent_means is not None:
+            if hasattr(self, "latent_means"):
                 latents = latents.mul(self.latents_std).add(self.latent_means)
             else:
-                latents = (latents * self.vae_scaling_factor) + self.vae_shift_factor
-            #latents = 1 / scalefactor * latents
+                #latents = (latents * self.vae_scaling_factor) # + self.vae_shift_factor
+                latents = 1 / scalefactor * latents
 
             # print("post_quant_conv dtype:", self.vae.post_quant_conv.weight.dtype)  # torch.float32
             # x = torch.nn.functional.conv2d(latents, self.vae.post_quant_conv.weight.detach(), stride=1, padding=0)
@@ -790,7 +791,8 @@ class SdxlStableDiffusionLongPromptWeightingPipeline:
             #if self.latent_means is not None:
             #    init_latent_dist = init_latent_dist.mul(self.latent_means).div(self.latents_std)
             init_latents = init_latent_dist.sample(generator=generator)
-            if self.latent_means is not None:
+            #if self.latent_means is not None:
+            if hasattr(self, "latent_means"):
                 init_latents = init_latents.sub(self.latent_means).div(self.latents_std)
             else:
                 init_latents = self.vae_scaling_factor * init_latents 

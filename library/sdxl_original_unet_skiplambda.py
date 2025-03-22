@@ -455,6 +455,7 @@ class CrossAttention(nn.Module):
         heads: int = 8,
         dim_head: int = 64,
         upcast_attention: bool = False,
+        alt_attention=None
     ):
         super().__init__()
         inner_dim = dim_head * heads
@@ -476,6 +477,11 @@ class CrossAttention(nn.Module):
         self.use_memory_efficient_attention_xformers = False
         self.use_memory_efficient_attention_mem_eff = False
         self.use_sdpa = False
+        self.alt_attention = alt_attention
+        self.fattn = F.scaled_dot_product_attention
+        if self.alt_attention is not None:
+            self.fattn = self.alt_attention
+
         self.use_laser_sdpa = False
         self.use_qknorm = False
         self.use_laser_qknorm = False
@@ -484,6 +490,7 @@ class CrossAttention(nn.Module):
         self.qkn_gnought = nn.Parameter(torch.tensor(8.0))
         #self.qkn_gnought = False
         #self.qkn_gnought.requires_grad_(False)  #maybe this will stop non-qknorm runs from frying! haha this is pytorch something bad will happen anyways.
+
 
     def set_use_memory_efficient_attention(self, xformers, mem_eff):
         self.use_memory_efficient_attention_xformers = xformers
@@ -643,19 +650,20 @@ class CrossAttention(nn.Module):
         q, k, v = map(lambda t: rearrange(t, "b n (h d) -> b h n d", h=h), (q_in, k_in, v_in))  
         del q_in, k_in, v_in
 
+        if self.qkprojnorm is not None:
+            qkfunction = self.qkprojnorm
+        else:
+            qkfunction = nn.Identity()
+        q = qkfunction(q)
+        k = qkfunction(k)
+
         if self.use_laser_sdpa:
-            if self.qkprojnorm is not None:
-                qkfunction = self.qkprojnorm
-            else:
-                qkfunction = nn.Identity()
-            q = qkfunction(q)
-            k = qkfunction(k)
-            out = F.scaled_dot_product_attention(q, k, v, attn_mask=mask, dropout_p=0.0, is_causal=False)
+            out = self.fattn(q, k, v, attn_mask=mask, dropout_p=0.0, is_causal=False)
             out = rearrange(out, "b h n d -> b n (h d)", h=h) #oops transpose has to come before shift
             out = torch.log(out) + valueoffset_biggymax
             del valueoffset_biggymax
         else:
-            out = F.scaled_dot_product_attention(q, k, v, attn_mask=mask, dropout_p=0.0, is_causal=False)
+            out = self.fattn(q, k, v, attn_mask=mask, dropout_p=0.0, is_causal=False)
             out = rearrange(out, "b h n d -> b n (h d)", h=h)
         out = self.to_out[0](out)
         return out
@@ -687,7 +695,7 @@ class CrossAttention(nn.Module):
         del q_in, k_in, v_in
         
         #stock impl
-        out = F.scaled_dot_product_attention(q, k, v, attn_mask=mask, dropout_p=0.0, is_causal=False)
+        out = self.fattn(q, k, v, attn_mask=mask, dropout_p=0.0, is_causal=False)
         
         #scary einops reverse transpose
         out = rearrange(out, "b h n d -> b n (h d)", h=h)
@@ -743,25 +751,41 @@ class CrossAttention(nn.Module):
 
 class dynamic_shape_rmsnorm(nn.Module):
     def forward(self, inputter, **kwargs):
-        inputter = inputter.transpose(1,2)  #rotate!
+        #inputter = inputter.transpose(1,2)  #rotate!
         #i am so sorry haha
         #normalized_shape seems to require adjacencies, i tried a few other things first.
-        inner_shape = inputter.size()[3:]   
+        #inner_shape = inputter.size()[3:]
+        inner_shape = (inputter.size(-1),)   
 
-        nn.functional.rms_norm(inputter, normalized_shape=inner_shape, **kwargs)   
-        inputter = inputter.transpose(1,2)                  #reverse rotate!
-        return inputter
+        outputter = nn.functional.rms_norm(inputter, normalized_shape=inner_shape, **kwargs)   
+        #outputter =  outputter.transpose(1,2)                  #reverse rotate!
+        return outputter
 
 class dynamic_shape_layernorm(nn.Module):
     def forward(self, inputter, **kwargs):
-        inputter = inputter.transpose(1,2)  #rotate!
+        # note: it seems like the original construction of the dynamic shape rmsnorm was...
+        # handling a problem with a truly mysterious origin:
+        # perhaps using forwards slicing `.size()[3:]` 
+        # required a duplication of the head-dim slice for the same normalized shape
+        # for forwards-indexing to *select* the correct dim.
+        # regardless, all qknorm calls appear to be within a reshaped tensor anyways.
+        # so negative indexing should catch the right shape every time. i think.
+        #inputter = inputter.transpose(1,2)  #rotate!
         #i am so sorry haha
         #normalized_shape seems to require adjacencies, i tried a few other things first.
-        inner_shape = inputter.size()[3:]   
+        #inner_shape = inputter.size()[3:]
+        inner_shape = (inputter.size(-1),)
 
-        nn.functional.layer_norm(inputter, normalized_shape=inner_shape, **kwargs)   
-        inputter = inputter.transpose(1,2)                  #reverse rotate!
-        return inputter
+        outputter = nn.functional.layer_norm(inputter, normalized_shape=inner_shape, **kwargs)   
+        #outputter = outputter.transpose(1,2)                  #reverse rotate!
+        return outputter
+
+class dim_shape_layernorm(nn.Module):
+    def forward(self, inputter, **kwargs):
+        normalized_shape = (inputter.size(-1),)
+        outputter = nn.functional.layer_norm(inputter, normalized_shape=normalized_shape, **kwargs)
+        return outputter
+
 
 # feedforward
 class GEGLU(nn.Module):
@@ -832,7 +856,8 @@ class FeedForward(nn.Module):
 
 class BasicTransformerBlock(nn.Module):
     def __init__(
-        self, dim: int, num_attention_heads: int, attention_head_dim: int, cross_attention_dim: int, upcast_attention: bool = False, learnable_lambdas = 1, swiglu_switcharoo = False
+        self, dim: int, num_attention_heads: int, attention_head_dim: int, cross_attention_dim: int, upcast_attention: bool = False, learnable_lambdas = 1, swiglu_switcharoo = False,
+        alt_attention=None
     ):
         super().__init__()
 
@@ -850,6 +875,10 @@ class BasicTransformerBlock(nn.Module):
         self.activate_lambdagrad(self.learnable_lambdas)
 
         self.swiglu_switcharoo=swiglu_switcharoo
+        self.alt_attention=alt_attention
+
+        self.query_dim = dim
+        self.cross_attention_dim = cross_attention_dim
 
         # 1. Self-Attn
         self.attn1 = CrossAttention(
@@ -858,6 +887,7 @@ class BasicTransformerBlock(nn.Module):
             heads=num_attention_heads,
             dim_head=attention_head_dim,
             upcast_attention=upcast_attention,
+            alt_attention=self.alt_attention
         )
         self.ff = FeedForward(dim, swiglu_switcharoo=self.swiglu_switcharoo)
 
@@ -868,7 +898,10 @@ class BasicTransformerBlock(nn.Module):
             heads=num_attention_heads,
             dim_head=attention_head_dim,
             upcast_attention=upcast_attention,
+            alt_attention=self.alt_attention
         )
+        # 2.1 Cross-attn cond normalization
+        self.cross_cond_norm = nn.Identity()
 
         self.norm1 = nn.LayerNorm(dim)
         self.norm2 = nn.LayerNorm(dim)
@@ -914,6 +947,9 @@ class BasicTransformerBlock(nn.Module):
     def set_use_layerqknorm(self, layerqknorm: bool):
         self.attn1.set_use_layerqknorm(layerqknorm)
         self.attn2.set_use_layerqknorm(layerqknorm)
+        
+        #use to adjust text conditioner outputs to unit variance. ty cheald
+        self.cross_cond_norm = dynamic_shape_layernorm()
     
 
     def forward_body(self, hidden_states, context=None, timestep=None):
@@ -924,7 +960,11 @@ class BasicTransformerBlock(nn.Module):
 
         # 2. Cross-Attention
         norm_hidden_states = self.norm2(hidden_states)
-        hidden_states = self.attn2(norm_hidden_states, context=context) + self.learnedlambda2*hidden_states
+        if context is not None:
+            norm_context = self.cross_cond_norm(context)
+        else:
+            norm_context = context
+        hidden_states = self.attn2(norm_hidden_states, context=norm_context) + self.learnedlambda2*hidden_states
 
         # 3. Feed-forward
         #hidden_states = self.ff(self.norm3(hidden_states)) + hidden_states
@@ -962,7 +1002,8 @@ class Transformer2DModel(nn.Module):
         upcast_attention: bool = False,
         num_transformer_layers: int = 1,
         learnable_lambdas:int = 1,
-        swiglu_switcharoo:bool = False
+        swiglu_switcharoo:bool = False,
+        alt_attention=None
     ):
         super().__init__()
         self.in_channels = in_channels
@@ -980,6 +1021,7 @@ class Transformer2DModel(nn.Module):
         self.activate_lambdagrad(learnable_lambdas)
 
         self.swiglu_switcharoo=swiglu_switcharoo
+        self.alt_attention = alt_attention
 
         if use_linear_projection:
             self.proj_in = nn.Linear(in_channels, inner_dim)
@@ -996,7 +1038,8 @@ class Transformer2DModel(nn.Module):
                     cross_attention_dim=cross_attention_dim,
                     upcast_attention=upcast_attention,
                     learnable_lambdas = learnable_lambdas,
-                    swiglu_switcharoo=self.swiglu_switcharoo
+                    swiglu_switcharoo=self.swiglu_switcharoo,
+                    alt_attention=self.alt_attention
                 )
             )
 
@@ -1164,6 +1207,20 @@ class SdxlUNet2DConditionModel(nn.Module):
         else:
             self.swiglu_switcharoo = False
 
+        self.use_z_loss = False
+        if "use_z_loss" in kwargs.keys():
+            self.use_z_loss = kwargs["use_z_loss"]
+        self.z_loss_coefficient = 1e-4
+        if "z_loss_coefficient" in kwargs.keys():
+            self.z_loss_coefficient = kwargs["z_loss_coefficient"]
+        self.alt_attention = None
+        if "sage_attn" in kwargs.keys():
+            if kwargs["sage_attn"]==True:
+                from sageattention import sageattn
+                #F.scaled_dot_product_attention = sageattn
+                self.alt_attention = sageattn
+                print(f"enabled sageattn")
+
         # time embedding
         self.time_embed = nn.Sequential(
             nn.Linear(self.model_channels, self.time_embed_dim),
@@ -1225,7 +1282,8 @@ class SdxlUNet2DConditionModel(nn.Module):
                     use_linear_projection=True,
                     cross_attention_dim=2048,
                     learnable_lambdas = self.learnable_lambdas,
-                    swiglu_switcharoo=self.swiglu_switcharoo
+                    swiglu_switcharoo=self.swiglu_switcharoo,
+                    alt_attention=self.alt_attention
                 ),
             ]
             self.input_blocks.append(nn.ModuleList(layers))
@@ -1255,7 +1313,8 @@ class SdxlUNet2DConditionModel(nn.Module):
                     use_linear_projection=True,
                     cross_attention_dim=2048,
                     learnable_lambdas = self.learnable_lambdas,
-                    swiglu_switcharoo=self.swiglu_switcharoo
+                    swiglu_switcharoo=self.swiglu_switcharoo, 
+                    alt_attention=self.alt_attention
                 ),
             ]
             self.input_blocks.append(nn.ModuleList(layers))
@@ -1276,7 +1335,8 @@ class SdxlUNet2DConditionModel(nn.Module):
                     use_linear_projection=True,
                     cross_attention_dim=2048,
                     learnable_lambdas = self.learnable_lambdas,
-                    swiglu_switcharoo=self.swiglu_switcharoo
+                    swiglu_switcharoo=self.swiglu_switcharoo, 
+                    alt_attention=self.alt_attention
                 ),
                 ResnetBlock2D(
                     in_channels=4 * self.model_channels,
@@ -1305,7 +1365,8 @@ class SdxlUNet2DConditionModel(nn.Module):
                     use_linear_projection=True,
                     cross_attention_dim=2048,
                     learnable_lambdas = self.learnable_lambdas,
-                    swiglu_switcharoo=self.swiglu_switcharoo
+                    swiglu_switcharoo=self.swiglu_switcharoo, 
+                    alt_attention=self.alt_attention
                 ),
             ]
             if i == 2:
@@ -1334,7 +1395,8 @@ class SdxlUNet2DConditionModel(nn.Module):
                     use_linear_projection=True,
                     cross_attention_dim=2048,
                     learnable_lambdas = self.learnable_lambdas,
-                    swiglu_switcharoo=self.swiglu_switcharoo
+                    swiglu_switcharoo=self.swiglu_switcharoo, 
+                    alt_attention=self.alt_attention
                 ),
             ]
             if i == 2:
